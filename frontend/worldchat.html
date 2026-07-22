@@ -466,11 +466,13 @@ body {
 .input-area {
   background: var(--surface); border-top: 1px solid var(--border);
   padding: 10px 12px 12px; flex-shrink: 0;
+  overflow: hidden; max-width: 100vw;
 }
 .input-row {
   display: flex; align-items: flex-end; gap: 8px;
+  min-width: 0; max-width: 100%;
 }
-.attach-menu-wrapper { position: relative; }
+.attach-menu-wrapper { position: relative; flex-shrink: 0; }
 .attach-btn, .voice-btn, .send-btn {
   width: 44px; height: 44px; border-radius: 12px; border: 1px solid var(--border);
   background: var(--input-bg); cursor: pointer; display: flex;
@@ -487,28 +489,29 @@ body {
 .send-btn:active { transform: scale(0.97); }
 
 .input-text-wrap {
-  flex: 1; background: var(--input-bg); border: 1px solid var(--border);
+  flex: 1 1 auto; min-width: 0; background: var(--input-bg); border: 1px solid var(--border);
   border-radius: 14px; display: flex; align-items: flex-end; padding: 4px 12px;
   min-height: 44px; transition: border-color 0.2s;
 }
 .input-text-wrap:focus-within { border-color: var(--accent); }
 #msg {
-  flex: 1; background: none; border: none; color: var(--text);
+  flex: 1; min-width: 0; width: 100%; background: none; border: none; color: var(--text);
   font-size: 14px; font-family: inherit; resize: none; outline: none;
   line-height: 1.5; max-height: 100px; overflow-y: auto; padding: 8px 0;
   min-height: 28px;
 }
 #msg::placeholder { color: var(--muted); }
 .ask-btn {
-  width: 44px; height: 44px; border-radius: 12px; border: none; cursor: pointer;
+  width: 44px; min-width: 44px; height: 44px; border-radius: 12px; border: none; cursor: pointer;
   background: linear-gradient(135deg,#6366f1,#8b5cf6);
   color: white; font-size: 10px; font-weight: 700; font-family: inherit;
   display: flex; flex-direction: column; align-items: center; justify-content: center;
   gap: 1px; flex-shrink: 0; transition: all 0.2s;
-  box-shadow: 0 0 12px rgba(99,102,241,0.4);
+  box-shadow: 0 0 12px rgba(99,102,241,0.4); overflow: hidden;
 }
 .ask-btn:hover { opacity: 0.9; transform: scale(1.04); }
 .ask-btn .as-label { font-size: 8px; opacity: 0.8; }
+
 
 /* Attach popup */
 .attach-popup {
@@ -583,18 +586,22 @@ body {
   .chat-video { max-width: 72vw; }
 
   .input-area { padding: 8px 8px 10px; }
-  .attach-btn, .voice-btn, .send-btn { width: 40px; height: 40px; font-size: 17px; }
-  .ask-btn { width: 40px; height: 40px; font-size: 9px; }
+  .input-row { gap: 6px; }
+  .attach-btn, .voice-btn, .send-btn { width: 38px; height: 38px; font-size: 16px; border-radius: 10px; }
+  .ask-btn { width: 38px; min-width: 38px; height: 38px; border-radius: 10px; }
   #msg { font-size: 16px; } /* prevents iOS auto-zoom on focus */
-  .input-text-wrap { min-height: 40px; padding: 3px 10px; }
+  .input-text-wrap { min-height: 38px; padding: 3px 10px; border-radius: 12px; }
   .exit-btn { padding: 6px 12px; font-size: 11px; }
 
   .notify-card { padding: 22px 18px; }
   .menu { width: 240px; right: -240px; }
 }
 
-@media(max-width:360px){
+@media(max-width:420px){
   .ask-btn .as-label { display: none; }
+}
+
+@media(max-width:360px){
   .topbar-title p { display: none; }
 }
 
