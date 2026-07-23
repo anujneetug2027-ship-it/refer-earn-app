@@ -49,7 +49,11 @@ async function notifyMentions({ text, senderUsername }) {
           if (err.statusCode === 404 || err.statusCode === 410) {
             await NotificationSubscriber.deleteOne({ _id: sub._id });
           } else {
-            console.error("Push error:", err.message);
+            console.error(
+              "Push error:", err.message,
+              "| statusCode:", err.statusCode,
+              "| body:", err.body
+            );
           }
         }
       }
