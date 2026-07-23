@@ -899,10 +899,24 @@ function updateBellState(){
   document.getElementById("bellBtn").classList.toggle("enabled", enabled);
 }
 
+// Register the service worker as soon as the script loads (not gated behind
+// window "load", which can race with a fast tap on the bell). Keep the
+// promise so requestNotifyPermission() can reuse/await the same registration
+// instead of blindly trusting navigator.serviceWorker.ready (which hangs
+// forever with zero feedback if registration ever failed).
+let swRegistrationPromise = null;
 if("serviceWorker" in navigator){
-  window.addEventListener("load", () => {
-    navigator.serviceWorker.register("/sw.js").catch(() => {});
+  swRegistrationPromise = navigator.serviceWorker.register("/sw.js").catch((err) => {
+    console.error("Service worker registration failed:", err);
+    return null;
   });
+}
+
+function withTimeout(promise, ms, message){
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(message)), ms))
+  ]);
 }
 
 function openNotifyModal(){
@@ -950,7 +964,20 @@ async function requestNotifyPermission(){
       return;
     }
 
-    const reg = await navigator.serviceWorker.ready;
+    // Make sure the service worker is actually registered before waiting on
+    // it — if registration failed (e.g. sw.js missing on the server), this
+    // throws a clear error instead of hanging forever.
+    let registered = swRegistrationPromise ? await swRegistrationPromise : null;
+    if(!registered){
+      registered = await navigator.serviceWorker.register("/sw.js").catch((err) => {
+        throw new Error("Couldn't load the service worker (sw.js). " + err.message);
+      });
+    }
+    const reg = await withTimeout(
+      navigator.serviceWorker.ready,
+      8000,
+      "Service worker took too long to activate"
+    );
 
     // Get VAPID public key from backend
     const keyRes = await fetch(`${BACKEND}/api/notify/vapid-public-key`);
@@ -960,13 +987,19 @@ async function requestNotifyPermission(){
       return;
     }
 
-    let subscription = await reg.pushManager.getSubscription();
-    if(!subscription){
-      subscription = await reg.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey: urlB64ToUint8Array(keyData.key)
-      });
+    // Always start clean: an old subscription (from an earlier test, or from
+    // before VAPID keys were finalized) is permanently bound to whichever
+    // key existed when it was created. Reusing it after keys change causes
+    // every push to be silently rejected by the push service. Unsubscribing
+    // first guarantees the new subscription matches today's server key.
+    const existing = await reg.pushManager.getSubscription();
+    if(existing){
+      await existing.unsubscribe().catch(() => {});
     }
+    const subscription = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlB64ToUint8Array(keyData.key)
+    });
 
     const deviceId = getDeviceId();
 
@@ -988,7 +1021,8 @@ async function requestNotifyPermission(){
       showToast(data.msg || "Couldn't turn on notifications");
     }
   } catch(e){
-    showToast("Couldn't enable notifications");
+    console.error("Notification setup failed:", e);
+    showToast("Couldn't enable notifications: " + (e && e.message ? e.message : "unknown error"));
   }
 }
 
