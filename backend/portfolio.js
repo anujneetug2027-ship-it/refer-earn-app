@@ -37,6 +37,7 @@ const stockHoldingSchema = new mongoose.Schema({
 const cryptoHoldingSchema = new mongoose.Schema({
   userEmail:    { type: String, required: true, index: true },
   coinId:       { type: String, required: true },
+  symbol:       { type: String },   // ticker hint (e.g. "BTC") for Binance lookups
   name:         { type: String, required: true },
   quantity:     { type: Number, required: true, min: 0 },
   buyPrice:     { type: Number, required: true, min: 0 },
@@ -332,26 +333,114 @@ async function searchStocks(q) {
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  CRYPTO — CoinGecko PRIMARY (keyless public API), CoinPaprika fallback
-//  Note: CoinCap's free v2 API was retired in 2025 (api.coincap.io no
-//  longer resolves) — that was the previous primary source and is why
-//  BTC/ETH prices were showing "—". CoinGecko's keyless public API is
-//  still free with no signup; it's just rate-limited (~10-30 req/min),
-//  which the caching below is tuned around.
+//  CRYPTO — Binance PRIMARY, CoinGecko secondary, CoinPaprika tertiary
+//
+//  Why Binance first: CoinGecko's keyless public API actively 403s
+//  requests coming from several cloud/hosting IP ranges (confirmed for
+//  Cloudflare Workers, and Render's shared IPs hit the same wall) —
+//  that's why crypto was completely dead ("nothing working"). CoinCap's
+//  free v2 API (the original primary) was retired outright in 2025.
+//  Binance's public *market data* endpoints (no auth, no key) are far
+//  more permissive from server IPs and also give real historical
+//  candles for free, which CoinPaprika's free tier does NOT (historical
+//  data there is a paid-only feature) — so Binance covers both price
+//  and charts, CoinGecko is the fallback when a coin isn't on Binance,
+//  and CoinPaprika only ever supplies a last-resort *current* price.
 // ══════════════════════════════════════════════════════════════════
-var CG_HEADERS = { 'Accept': 'application/json' };
+var CG_HEADERS = { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' };
+var BINANCE_HEADERS = { 'Accept': 'application/json' };
 
-// CoinPaprika needs its own "btc-bitcoin" style ids — map the handful
-// of coins this app ships with; anything else just skips the fallback.
-var PAPRIKA_ID = {
-  'bitcoin': 'btc-bitcoin', 'ethereum': 'eth-ethereum', 'solana': 'sol-solana',
-  'dogecoin': 'doge-dogecoin', 'chainlink': 'link-chainlink',
+// Known CoinGecko-id → Binance trading symbol map for the coins this app
+// ships with by default. Anything else (a coin found via search) gets a
+// *guessed* symbol from its ticker (e.g. "PEPE" → "PEPEUSDT") and we just
+// try it — Binance 400s harmlessly if that guess doesn't exist, and we
+// fall through to CoinGecko/CoinPaprika.
+var BINANCE_SYMBOL = {
+  'bitcoin': 'BTCUSDT', 'ethereum': 'ETHUSDT', 'solana': 'SOLUSDT',
+  'dogecoin': 'DOGEUSDT', 'chainlink': 'LINKUSDT', 'bitget-token': 'BGBUSDT',
 };
 
-async function getCryptoPrice(id) {
+function guessBinanceSymbol(id, symbolHint) {
+  if (BINANCE_SYMBOL[id]) return BINANCE_SYMBOL[id];
+  if (symbolHint) return symbolHint.toUpperCase().replace(/USDT$/, '') + 'USDT';
+  return null;
+}
+
+// USDT ≈ USD; convert via a real USD/INR rate. Frankfurter (ECB-backed,
+// free, keyless, rarely blocked) is primary; CoinGecko's tether/inr pair
+// is the fallback if Frankfurter is ever unreachable.
+async function getUSDINRRate() {
+  var cached = getCache('usdinr', 3600000);
+  if (cached) return cached;
+  try {
+    var r = await fetch('https://api.frankfurter.app/latest?from=USD&to=INR');
+    if (r.ok) {
+      var d = await r.json();
+      var rate = d && d.rates && d.rates.INR;
+      if (rate) { setCache('usdinr', rate); return rate; }
+    }
+  } catch (e) { console.error('[frankfurter usd-inr]', e.message); }
+  try {
+    var r2 = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=inr', { headers: CG_HEADERS });
+    if (r2.ok) {
+      var d2 = await r2.json();
+      var rate2 = d2 && d2.tether && d2.tether.inr;
+      if (rate2) { setCache('usdinr', rate2); return rate2; }
+    }
+  } catch (e) { console.error('[coingecko usd-inr]', e.message); }
+  return 88; // last-resort static fallback
+}
+
+async function getBinancePriceUSDT(symbol) {
+  try {
+    var r = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=' + encodeURIComponent(symbol), { headers: BINANCE_HEADERS });
+    if (r.ok) {
+      var d = await r.json();
+      if (d && d.price) return parseFloat(d.price);
+    }
+  } catch (e) { console.error('[binance price]', symbol, e.message); }
+  return null;
+}
+
+var BINANCE_KLINE_CFG = {
+  '1H': { interval: '1m',  limit: 60  }, '1D': { interval: '15m', limit: 96  },
+  '1W': { interval: '2h',  limit: 84  }, '1M': { interval: '6h',  limit: 120 },
+  '3M': { interval: '1d',  limit: 90  }, '1Y': { interval: '1d',  limit: 365 },
+  '2Y': { interval: '3d',  limit: 243 },
+};
+
+async function getBinanceKlinesUSDT(symbol, range) {
+  var cfg = BINANCE_KLINE_CFG[range] || BINANCE_KLINE_CFG['1D'];
+  try {
+    var url = 'https://api.binance.com/api/v3/klines?symbol=' + encodeURIComponent(symbol)
+      + '&interval=' + cfg.interval + '&limit=' + cfg.limit;
+    var r = await fetch(url, { headers: BINANCE_HEADERS });
+    if (r.ok) {
+      var d = await r.json();
+      if (Array.isArray(d) && d.length > 1) {
+        // kline row: [openTime, open, high, low, close, volume, closeTime, ...]
+        return d.map(function(row){ return { t: row[0], priceUsdt: parseFloat(row[4]) }; });
+      }
+    }
+  } catch (e) { console.error('[binance klines]', symbol, e.message); }
+  return null;
+}
+
+async function getCryptoPrice(id, symbolHint) {
   var ck = 'cgp:' + id;
-  var cached = getCache(ck, 90000);
+  var cached = getCache(ck, 60000);
   if (cached !== null) return cached;
+
+  var binSym = guessBinanceSymbol(id, symbolHint);
+  if (binSym) {
+    var usdt = await getBinancePriceUSDT(binSym);
+    if (usdt) {
+      var rate = await getUSDINRRate();
+      var price = usdt * rate;
+      setCache(ck, price);
+      return price;
+    }
+  }
 
   try {
     var url = 'https://api.coingecko.com/api/v3/simple/price?ids=' + encodeURIComponent(id) + '&vs_currencies=inr';
@@ -362,41 +451,45 @@ async function getCryptoPrice(id) {
     }
   } catch (e) { console.error('[coingecko price]', id, e.message); }
 
-  var paprikaId = PAPRIKA_ID[id];
-  if (paprikaId) {
-    try {
-      var r2 = await fetch('https://api.coinpaprika.com/v1/tickers/' + paprikaId + '?quotes=USD');
-      if (r2.ok) {
-        var d2 = await r2.json();
-        var usd = d2 && d2.quotes && d2.quotes.USD && d2.quotes.USD.price;
+  try {
+    // CoinPaprika ids are "btc-bitcoin" style; try a couple of common guesses.
+    var guesses = symbolHint ? [symbolHint.toLowerCase() + '-' + id] : [];
+    var r3 = await fetch('https://api.coinpaprika.com/v1/search?q=' + encodeURIComponent(id) + '&c=currencies&limit=1');
+    if (r3.ok) {
+      var d3 = await r3.json();
+      var hit = d3 && d3.currencies && d3.currencies[0];
+      if (hit) guesses.unshift(hit.id);
+    }
+    for (var i = 0; i < guesses.length; i++) {
+      var r4 = await fetch('https://api.coinpaprika.com/v1/tickers/' + guesses[i] + '?quotes=USD');
+      if (r4.ok) {
+        var d4 = await r4.json();
+        var usd = d4 && d4.quotes && d4.quotes.USD && d4.quotes.USD.price;
         if (usd) {
-          // rough USD->INR via a cached rate from CoinGecko's own USD/INR-priced BTC pair
-          var rate = await getUSDINRRate();
-          if (rate) { var price = usd * rate; setCache(ck, price); return price; }
+          var rate2 = await getUSDINRRate();
+          var price2 = usd * rate2;
+          setCache(ck, price2);
+          return price2;
         }
       }
-    } catch (e) { console.error('[coinpaprika price]', id, e.message); }
-  }
-  return null;
-}
-
-async function getUSDINRRate() {
-  var cached = getCache('usdinr', 3600000);
-  if (cached) return cached;
-  try {
-    var r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=inr', { headers: CG_HEADERS });
-    if (r.ok) {
-      var d = await r.json();
-      var rate = d && d.tether && d.tether.inr;
-      if (rate) { setCache('usdinr', rate); return rate; }
     }
-  } catch (e) { console.error('[usd-inr]', e.message); }
-  return 88; // reasonable fallback
+  } catch (e) { console.error('[coinpaprika price]', id, e.message); }
+
+  return null;
 }
 
 var CG_CHART_DAYS = { '1H':'1','1D':'1','1W':'7','1M':'30','3M':'90','1Y':'365','2Y':'730' };
 
-async function getCryptoChart(id, range) {
+async function getCryptoChart(id, range, symbolHint) {
+  var binSym = guessBinanceSymbol(id, symbolHint);
+  if (binSym) {
+    var klines = await getBinanceKlinesUSDT(binSym, range);
+    if (klines) {
+      var rate = await getUSDINRRate();
+      return klines.map(function(k){ return { x: k.t, y: parseFloat((k.priceUsdt * rate).toFixed(4)) }; });
+    }
+  }
+
   var days = CG_CHART_DAYS[range] || '1';
   try {
     var url = 'https://api.coingecko.com/api/v3/coins/' + encodeURIComponent(id) + '/market_chart?vs_currency=inr&days=' + days;
@@ -410,46 +503,77 @@ async function getCryptoChart(id, range) {
 }
 
 // 2y daily series used for period-gain math (independent of chart "range" UI)
-async function getCryptoHistory(id) {
+async function getCryptoHistory(id, symbolHint) {
   var ck = 'ch:' + id;
   var cached = getCache(ck, 21600000);
   if (cached) return cached;
-  var data = await getCryptoChart(id, '2Y');
+  var data = await getCryptoChart(id, '2Y', symbolHint);
   var series = data.map(function(p){ return { t: new Date(p.x), price: p.y }; });
-  setCache(ck, series);
+  if (series.length) setCache(ck, series);
   return series;
 }
 
-// Crypto search — CoinGecko's keyless /search endpoint, free & no key.
+// Crypto search — CoinGecko's keyless /search endpoint primary (works for
+// most requests despite the occasional cloud-IP 403), CoinPaprika's free
+// /search as fallback so the feature still works if CoinGecko is blocked.
 async function searchCrypto(q) {
   try {
     var url = 'https://api.coingecko.com/api/v3/search?query=' + encodeURIComponent(q);
     var r = await fetch(url, { headers: CG_HEADERS });
-    if (!r.ok) return [];
-    var d = await r.json();
-    var coins = (d && d.coins) || [];
-    return coins.slice(0, 15).map(function(c){
-      return { id: c.id, name: c.name, symbol: (c.symbol||'').toUpperCase() };
-    });
-  } catch (e) { console.error('[crypto search]', q, e.message); return []; }
+    if (r.ok) {
+      var d = await r.json();
+      var coins = (d && d.coins) || [];
+      if (coins.length) return coins.slice(0, 15).map(function(c){ return { id: c.id, name: c.name, symbol: (c.symbol||'').toUpperCase() }; });
+    }
+  } catch (e) { console.error('[coingecko search]', q, e.message); }
+
+  try {
+    var r2 = await fetch('https://api.coinpaprika.com/v1/search?q=' + encodeURIComponent(q) + '&c=currencies&limit=15');
+    if (r2.ok) {
+      var d2 = await r2.json();
+      var coins2 = (d2 && d2.currencies) || [];
+      return coins2.slice(0, 15).map(function(c){ return { id: c.id, name: c.name, symbol: (c.symbol||'').toUpperCase() }; });
+    }
+  } catch (e) { console.error('[coinpaprika search]', q, e.message); }
+  return [];
 }
 
 // ══════════════════════════════════════════════════════════════════
 //  METALS — Gold / Silver / Platinum via MetalPriceAPI + retail premium
+//
+//  IMPORTANT QUOTA NOTE: MetalPriceAPI's free plan allows only 100 API
+//  requests per MONTH, total. The previous version re-fetched every
+//  historical anchor date every 6 hours — since a past date's price
+//  never changes, that was burning the entire monthly quota within a
+//  day or two, after which every metal call failed and the UI fell
+//  back to a stale hardcoded price (which is exactly the "gold shows
+//  13,729 instead of 15,600" / "chart looks wrong" symptom reported).
+//  Fix: historical dates are now cached essentially permanently (they
+//  are immutable facts), and the "live" price is cached for 20 minutes
+//  instead of 1 — a realistic cadence for a 100-req/month budget. A
+//  "sticky" last-known-good value is also kept forever in memory and
+//  used as the fallback instead of the static constant, so a quota lull
+//  shows your last *real* price rather than a months-old number.
 // ══════════════════════════════════════════════════════════════════
+var METAL_SYMBOL = { gold: 'XAU', silver: 'XAG', platinum: 'XPT' };
+
 // Spot prices from MetalPriceAPI reflect wholesale/LBMA-style rates.
 // Retail digital-gold/silver/platinum apps (Paytm, PhonePe, etc.) charge
-// spot + GST (3%) + a dealer spread — typically pushing the shown rate
-// noticeably above raw spot. These premiums are an approximation to get
-// closer to what you'd actually see in-app; tune via env vars if needed.
-var METAL_SYMBOL = { gold: 'XAU', silver: 'XAG', platinum: 'XPT' };
+// spot + GST (3%) + a dealer spread — these premiums are tuned to land
+// close to real retail-app prices; tune further via env vars if your
+// app's rate drifts from these.
 var METAL_PREMIUM_PCT = {
-  gold:     parseFloat(process.env.GOLD_PREMIUM_PCT)     || 12,
-  silver:   parseFloat(process.env.SILVER_PREMIUM_PCT)   || 15,
-  platinum: parseFloat(process.env.PLATINUM_PREMIUM_PCT) || 10,
+  gold:     parseFloat(process.env.GOLD_PREMIUM_PCT)     || 18,
+  silver:   parseFloat(process.env.SILVER_PREMIUM_PCT)   || 20,
+  platinum: parseFloat(process.env.PLATINUM_PREMIUM_PCT) || 25,
 };
 var METAL_FALLBACK = { gold: 7400, silver: 95, platinum: 3300 };
 var METAL_NAME = { gold: 'Digital Gold', silver: 'Digital Silver', platinum: 'Digital Platinum' };
+
+// Sticky "last known good" store — never expires on its own, only ever
+// overwritten by a fresh successful fetch. Used as the fallback before
+// the hardcoded METAL_FALLBACK constant.
+var _stickyGood = {};
 
 function applyPremium(spotPerGram, type) {
   var pct = METAL_PREMIUM_PCT[type] || 0;
@@ -465,6 +589,7 @@ async function getMetalSpotPerGram(type) {
     if (r.ok) {
       var d = await r.json();
       if (d && d.rates && d.rates[sym]) return (1 / d.rates[sym]) / 31.1035; // troy oz → gram
+      if (d && d.error) console.error('[metal spot]', type, d.error.code, d.error.info);
     }
   } catch (e) { console.error('[metal spot]', type, e.message); }
   return null;
@@ -472,20 +597,37 @@ async function getMetalSpotPerGram(type) {
 
 async function getMetalPrice(type) {
   var ck = 'mp:' + type;
-  var cached = getCache(ck, 60000);
+  var cached = getCache(ck, 1200000); // 20 min — conservative against the 100/mo quota
   if (cached !== null) return cached;
+
   var spot = await getMetalSpotPerGram(type);
-  var price = spot ? applyPremium(spot, type) : METAL_FALLBACK[type];
-  setCache(ck, price);
-  return price;
+  if (spot) {
+    var price = applyPremium(spot, type);
+    setCache(ck, price);
+    _stickyGood['mp:' + type] = price;
+    return price;
+  }
+
+  // Fetch failed (quota exhausted, network hiccup, etc.) — prefer the
+  // last real price we successfully saw over a hardcoded constant.
+  return _stickyGood['mp:' + type] != null ? _stickyGood['mp:' + type] : METAL_FALLBACK[type];
 }
+
+// A past date's price is an immutable fact — cache it effectively
+// forever (10 years) rather than re-spending quota on it daily.
+var PERMANENT_TTL = 315360000000;
 
 async function getMetalHistoricalSpot(type, date) {
   var sym = METAL_SYMBOL[type];
   var dateStr = date.toISOString().split('T')[0];
   var ck = 'mh:' + type + ':' + dateStr;
-  var cached = getCache(ck, 86400000);
+  var cached = getCache(ck, PERMANENT_TTL);
   if (cached !== null) return cached;
+
+  // Don't hammer the same failed date repeatedly within a short window.
+  var failCk = 'mhfail:' + type + ':' + dateStr;
+  if (getCache(failCk, 3600000) !== null) return null;
+
   try {
     var url = 'https://api.metalpriceapi.com/v1/' + dateStr + '?api_key=' + METAL_API_KEY + '&base=INR&currencies=' + sym;
     var r = await fetch(url);
@@ -497,28 +639,29 @@ async function getMetalHistoricalSpot(type, date) {
         setCache(ck, price);
         return price;
       }
+      if (d && d.error) console.error('[metal historical]', type, dateStr, d.error.code, d.error.info);
     }
   } catch (e) { console.error('[metal historical]', type, dateStr, e.message); }
+  setCache(failCk, true);
   return null;
 }
 
-// Build a real-anchored series: today + 1d/7d/30d/365d ago, all fetched
-// from the historical endpoint (genuine data points), linearly interpolated
-// for the visual line between anchors — no random-walk simulation.
-async function getMetalHistory(type) {
-  var ck = 'mser:' + type;
-  var cached = getCache(ck, 21600000);
-  if (cached) return cached;
+// Real-anchored series across the last year, fetched once and cached
+// permanently per-date (see above) — genuine historical data points,
+// linearly interpolated for the visual line between them. More anchors
+// than before so Week/Month/Year ranges each show a genuinely different
+// shape instead of all collapsing to the same couple of points.
+var METAL_ANCHOR_DAYS = [365, 300, 240, 180, 120, 90, 60, 45, 30, 21, 14, 10, 7, 5, 3, 1, 0];
 
-  var anchors = [365, 30, 7, 1, 0];
+async function getMetalHistory(type) {
   var points = [];
-  for (var i = 0; i < anchors.length; i++) {
-    var d = anchors[i] === 0 ? new Date() : daysAgo(anchors[i]);
-    var price = anchors[i] === 0 ? await getMetalPrice(type) : await getMetalHistoricalSpot(type, d);
+  for (var i = 0; i < METAL_ANCHOR_DAYS.length; i++) {
+    var n = METAL_ANCHOR_DAYS[i];
+    var d = n === 0 ? new Date() : daysAgo(n);
+    var price = n === 0 ? await getMetalPrice(type) : await getMetalHistoricalSpot(type, d);
     if (price) points.push({ t: d, price: price });
   }
   points.sort(function(a, b){ return a.t - b.t; });
-  setCache(ck, points);
   return points;
 }
 
@@ -658,22 +801,19 @@ router.get('/proxy/stock-search', async function(req, res) {
 });
 
 router.get('/proxy/crypto', async function(req, res) {
-  var id = req.query.id;
+  var id = req.query.id, symbol = req.query.symbol;
   if (!id) return res.json({ price: null });
-  var cached = getCache('cp:' + id);
-  if (cached !== null) return res.json({ price: cached });
-  var price = await getCryptoPrice(id);
-  if (price) setCache('cp:' + id, price);
+  var price = await getCryptoPrice(id, symbol);
   res.json({ price: price });
 });
 
 router.get('/proxy/crypto-chart', async function(req, res) {
-  var id = req.query.id, range = req.query.range || '1D';
+  var id = req.query.id, range = req.query.range || '1D', symbol = req.query.symbol;
   if (!id) return res.json({ data: [] });
   var ck = 'cc:' + id + ':' + range;
   var cached = getCache(ck, 300000);
   if (cached) return res.json({ data: cached });
-  var data = await getCryptoChart(id, range);
+  var data = await getCryptoChart(id, range, symbol);
   if (data.length) setCache(ck, data);
   res.json({ data: data });
 });
@@ -793,7 +933,7 @@ router.post('/add', requireUser, async function(req, res) {
       if (parseFloat(b.quantity) <= 0 || parseFloat(b.buyPrice) <= 0)
         return res.json({ success: false, msg: 'Quantity and price must be > 0' });
       h = new CryptoHolding({
-        userEmail: req.userEmail, coinId: b.assetKey, name: b.name,
+        userEmail: req.userEmail, coinId: b.assetKey, symbol: b.symbol || null, name: b.name,
         quantity: parseFloat(b.quantity), buyPrice: parseFloat(b.buyPrice),
         purchaseDate: new Date(b.purchaseDate), leverage: parseInt(b.leverage) || 1
       });
@@ -815,12 +955,14 @@ router.post('/add', requireUser, async function(req, res) {
         return res.json({ success: false, msg: 'Missing required fields' });
 
       if (b.method === 'onetime') {
-        var amount = parseFloat(b.amount);
-        var nav    = parseFloat(b.buyPrice);
+        // Same convention as stocks/crypto/utility: units + price (NAV) + date.
+        // The frontend auto-fetches the NAV for the chosen date, but it's
+        // an editable field, same as everywhere else.
+        var units = parseFloat(b.units);
+        var nav   = parseFloat(b.buyPrice);
         if (!b.purchaseDate) return res.json({ success: false, msg: 'Purchase date required' });
-        if (!amount || amount <= 0) return res.json({ success: false, msg: 'Enter a valid invested amount' });
+        if (!units || units <= 0) return res.json({ success: false, msg: 'Enter a valid unit quantity' });
         if (!nav || nav <= 0) return res.json({ success: false, msg: 'Enter a valid NAV price' });
-        var units = amount / nav;
         h = new MutualFundHolding({
           userEmail: req.userEmail, schemeCode: String(b.schemeCode), name: b.name, method: 'onetime',
           units: units, buyPrice: nav, purchaseDate: new Date(b.purchaseDate)
@@ -919,8 +1061,8 @@ router.get('/gains', requireUser, async function(req, res) {
 
     // ── Crypto ──
     var cryptoGains = await Promise.all(crypto.map(async function(h) {
-      var series = await getCryptoHistory(h.coinId);
-      var current = await getCryptoPrice(h.coinId);
+      var series = await getCryptoHistory(h.coinId, h.symbol);
+      var current = await getCryptoPrice(h.coinId, h.symbol);
       var lev = h.leverage || 1;
       var purchaseTs = new Date(h.purchaseDate).getTime();
       var unitsAsOf = function(d) { return d.getTime() >= purchaseTs ? h.quantity * lev : 0; };
