@@ -1918,11 +1918,51 @@ function clientSumGains(gainsList) {
 }
 
 function mfLotInvested(h) {
-  if (h.method === 'onetime') return (h.units||0) * (h.buyPrice||0);
-  const start = new Date(h.sipStartDate), now = new Date();
-  let months = (now.getFullYear()-start.getFullYear())*12 + (now.getMonth()-start.getMonth());
-  months = Math.max(months, 0) + 1;
-  return months * (h.sipAmount||0);
+  // One-time investment
+  if (h.method === 'onetime') {
+    return (h.units || 0) * (h.buyPrice || 0);
+  }
+
+  // SIP investment:
+  // Count ONLY SIP installments whose actual SIP date has arrived.
+  // The upcoming month's SIP must NOT be included.
+  const start = new Date(h.sipStartDate);
+  const now = new Date();
+
+  const sipAmount = Number(h.sipAmount) || 0;
+  const sipDay = Math.min(Math.max(Number(h.sipDay) || 1, 1), 28);
+
+  if (!sipAmount || isNaN(start.getTime())) return 0;
+
+  let cursor = new Date(
+    start.getFullYear(),
+    start.getMonth(),
+    sipDay
+  );
+
+  // If the SIP day has already passed before the SIP start date,
+  // the first installment is in the following month.
+  if (cursor < start) {
+    cursor = new Date(
+      start.getFullYear(),
+      start.getMonth() + 1,
+      sipDay
+    );
+  }
+
+  let completedInstallments = 0;
+
+  while (cursor <= now) {
+    completedInstallments++;
+
+    cursor = new Date(
+      cursor.getFullYear(),
+      cursor.getMonth() + 1,
+      sipDay
+    );
+  }
+
+  return completedInstallments * sipAmount;
 }
 
 function gainChipsHTML(gains) {
