@@ -322,22 +322,28 @@ async function getStockHistory(sym) {
   return { series: [], live: null };
 }
 
-// "Day" for a stock means since NSE's 9:15 AM IST market open — not a
-// rolling 24h window — persisting unchanged through the close and into
-// the evening until the next session opens. The 2y daily-close series
-// above is too coarse for this (it has no "open" tick), so this pulls a
-// short intraday series (15-min candles, last 5 days) and finds the
-// first tick at/after the correct session's open.
-async function getStockDayAnchorPrice(sym) {
-  var ck = 'sda:' + sym;
+// "Day" for a stock = today's price vs the previous trading day's
+// closing price — the standard "day change %" convention every broker
+// app uses (NOT since market open). Found by walking the daily-close
+// series backward from the most recent point whose IST calendar date is
+// strictly before today's — skipping any row that might represent
+// today's still-in-progress session — rather than a naive "24h ago"
+// lookup, which can misfire near midnight or during market hours.
+async function getStockPrevCloseAnchor(sym) {
+  var ck = 'spc:' + sym;
   var cached = getCache(ck, 300000); // 5 min
   if (cached !== null) return cached;
-  var y = await getYahooChart(sym, '5d', '15m');
-  if (!y || !y.series.length) return null;
-  var anchor = lastISTClockTime(9, 15);
-  var price = priceOnOrAfter(y.series, anchor);
-  if (price != null) setCache(ck, price);
-  return price;
+  var hist = await getStockHistory(sym);
+  if (!hist.series.length) return null;
+  var todayIST = istDateString(new Date());
+  var found = null;
+  for (var i = hist.series.length - 1; i >= 0; i--) {
+    if (istDateString(hist.series[i].t) < todayIST) { found = hist.series[i]; break; }
+  }
+  if (!found) found = hist.series[0];
+  var out = { date: found.t, price: found.price };
+  setCache(ck, out);
+  return out;
 }
 
 async function getStockPrice(sym) {
@@ -1204,16 +1210,16 @@ router.get('/gains', requireUser, async function(req, res) {
     ]);
     var stocks = lists[0], crypto = lists[1], utility = lists[2], mfs = lists[3];
 
-    // ── Stocks ── "Day" = since today's 9:15 AM IST market open (not a
-    // rolling 24h window), persisting until the next session opens.
+    // ── Stocks ── "Day" = vs the previous trading day's closing price
+    // (the standard convention), not since market open.
     var stockGains = await Promise.all(stocks.map(async function(h) {
       var hist = await getStockHistory(h.symbol);
       var current = hist.live;
       var purchaseTs = new Date(h.purchaseDate).getTime();
       var unitsAsOf = function(d) { return d.getTime() >= purchaseTs ? h.quantity : 0; };
       var inception = { date: new Date(h.purchaseDate), price: h.buyPrice, units: h.quantity };
-      var dayAnchorPrice = await getStockDayAnchorPrice(h.symbol);
-      var dayAnchor = dayAnchorPrice != null ? { date: lastISTClockTime(9, 15), price: dayAnchorPrice } : null;
+      var prevClose = await getStockPrevCloseAnchor(h.symbol);
+      var dayAnchor = prevClose ? { date: prevClose.date, price: prevClose.price } : null;
       return { id: String(h._id), gains: computeGainsForHolding(hist.series, current, unitsAsOf, inception, dayAnchor), currentPrice: current };
     }));
 
