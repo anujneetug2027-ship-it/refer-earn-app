@@ -359,14 +359,32 @@ async function getStockPrice(sym) {
 // Intraday (1H/1D) chart uses a finer Yahoo interval; longer ranges use
 // the cached 2y daily history sliced to range — all REAL data, no simulation.
 var RANGE_DAYS = { '1H': 1, '1D': 1, '1W': 7, '1M': 30, '3M': 90, '1Y': 365, '2Y': 730 };
+var NSE_SESSION_MS = (6 * 60 + 15) * 60000; // 9:15 AM -> 3:30 PM IST
 
 async function getStockChartData(sym, range) {
-  if (range === '1H' || range === '1D') {
-    var y = await getYahooChart(sym, '5d', range === '1H' ? '5m' : '15m');
-    if (y && y.series.length) {
-      var cutoff = Date.now() - (range === '1H' ? 3600000 : 86400000 * 1.5);
-      var sliced = y.series.filter(function(p){ return p.t.getTime() >= cutoff; });
-      return (sliced.length >= 2 ? sliced : y.series).map(function(p){ return { x: p.t.getTime(), y: p.price }; });
+  if (range === '1H') {
+    var y1 = await getYahooChart(sym, '5d', '5m');
+    if (y1 && y1.series.length) {
+      var cutoff1 = Date.now() - 3600000;
+      var sliced1 = y1.series.filter(function(p){ return p.t.getTime() >= cutoff1; });
+      return (sliced1.length >= 2 ? sliced1 : y1.series).map(function(p){ return { x: p.t.getTime(), y: p.price }; });
+    }
+  }
+  if (range === '1D') {
+    // Exactly ONE trading session — 9:15 AM to 3:30 PM IST of whichever
+    // session is current (today's, if the market has opened today;
+    // otherwise the most recently completed one) — never a rolling
+    // window that bleeds into an adjacent day's session.
+    var y2 = await getYahooChart(sym, '5d', '15m');
+    if (y2 && y2.series.length) {
+      var sessionStart = lastISTClockTime(9, 15);
+      var sessionEnd = Math.min(sessionStart.getTime() + NSE_SESSION_MS, Date.now());
+      var sliced2 = y2.series.filter(function(p){
+        var t = p.t.getTime();
+        return t >= sessionStart.getTime() && t <= sessionEnd;
+      });
+      if (sliced2.length >= 2) return sliced2.map(function(p){ return { x: p.t.getTime(), y: p.price }; });
+      return y2.series.map(function(p){ return { x: p.t.getTime(), y: p.price }; });
     }
   }
   var hist = await getStockHistory(sym);
