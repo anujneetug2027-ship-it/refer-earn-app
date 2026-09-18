@@ -445,15 +445,29 @@ async function getStockChartData(sym, range) {
 }
 
 // Keeps real stock prices flowing in even when nobody has the site open —
-// every 5 minutes, fetch the current price for every distinct symbol any
-// user actually holds and store it. getStockChartData() above then blends
-// these into the 1H/1D charts, so reopening the app after a few hours
-// shows the real path the price took meanwhile rather than a single
-// straight line from the last visit to now.
+// every 5 minutes DURING NSE MARKET HOURS ONLY, fetch the current price
+// for every distinct symbol any user actually holds and store it.
+// getStockChartData() above then blends these into the 1H/1D charts, so
+// reopening the app after a few hours shows the real path the price took
+// meanwhile rather than a single straight line from the last visit to now.
+//
+// Restricted to market hours because NSE prices don't move after 3:30 PM
+// (or before 9:15 AM, or on weekends) — polling around the clock just
+// wrote the same closing price over and over, which showed up as
+// pointless flat segments padding out the 1H/1D chart after hours.
 var STOCK_POLL_MS = 5 * 60 * 1000;
 var _stockPollerStarted = false;
 
+function isNSEMarketOpenNow() {
+  var nowIST = new Date(Date.now() + IST_OFFSET_MS);
+  var day = nowIST.getUTCDay(); // in IST wall-clock terms, since we shifted the instant
+  if (day === 0 || day === 6) return false; // Sat/Sun — exchange closed
+  var minutesOfDay = nowIST.getUTCHours() * 60 + nowIST.getUTCMinutes();
+  return minutesOfDay >= (9 * 60 + 15) && minutesOfDay <= (15 * 60 + 30);
+}
+
 async function pollAndStoreStockPrices() {
+  if (!isNSEMarketOpenNow()) return;
   try {
     var symbols = await StockHolding.distinct('symbol');
     for (var i = 0; i < symbols.length; i++) {
@@ -737,52 +751,7 @@ async function getCryptoChart(id, range, symbolHint) {
     }
   }
 
-  // Last resort — for coins that aren't on CoinGecko's chart endpoint
-  // (rate-limited / unrecognized id) nor listed on Kraken or Binance
-  // (typically low-liquidity or newly-listed tokens), try CoinPaprika's
-  // free daily-historical endpoint. This only gives 1-day resolution, but
-  // that's enough to compute Day/Week/Month/Year gains — previously these
-  // coins fell through to an empty array here, which is why their D/W/M
-  // gain chips showed "—" while Year (computed from purchase price, not
-  // this series) still worked.
-  try {
-    var paprikaId = await guessCoinPaprikaId(id, symbolHint);
-    if (paprikaId) {
-      var lookbackDays = Math.min(parseInt(days, 10) || 30, 1825);
-      var start = new Date(Date.now() - lookbackDays * 86400000).toISOString().slice(0, 10);
-      var rP = await fetch('https://api.coinpaprika.com/v1/tickers/' + paprikaId + '/historical?start=' + start + '&interval=1d');
-      if (rP.ok) {
-        var dP = await rP.json();
-        if (Array.isArray(dP) && dP.length > 1) {
-          rate = rate || await getUSDINRRate();
-          return dP.map(function(p){ return { x: new Date(p.timestamp).getTime(), y: parseFloat((p.price * rate).toFixed(4)) }; });
-        }
-      }
-    }
-  } catch (e) { console.error('[coinpaprika chart]', id, e.message); }
-
   return [];
-}
-
-// Resolves a CoinGecko-style id (or a bare symbol hint) to a CoinPaprika
-// coin id ("btc-bitcoin" style) via CoinPaprika's own search, preferring
-// an exact ticker-symbol match when we have one to go on.
-async function guessCoinPaprikaId(id, symbolHint) {
-  try {
-    var r = await fetch('https://api.coinpaprika.com/v1/search?q=' + encodeURIComponent(symbolHint || id) + '&c=currencies&limit=10');
-    if (r.ok) {
-      var d = await r.json();
-      var list = (d && d.currencies) || [];
-      if (list.length) {
-        if (symbolHint) {
-          var exact = list.find(function(c){ return (c.symbol || '').toLowerCase() === symbolHint.toLowerCase(); });
-          if (exact) return exact.id;
-        }
-        return list[0].id;
-      }
-    }
-  } catch (e) { console.error('[coinpaprika id lookup]', id, e.message); }
-  return null;
 }
 
 // 2y daily series used for period-gain math (independent of chart "range" UI)
