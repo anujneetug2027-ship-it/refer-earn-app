@@ -77,6 +77,17 @@ const CryptoHolding      = mongoose.models.CryptoHolding     || mongoose.model('
 const UtilityHolding     = mongoose.models.UtilityHolding    || mongoose.model('UtilityHolding',    utilityHoldingSchema);
 const MutualFundHolding  = mongoose.models.MutualFundHolding || mongoose.model('MutualFundHolding', mutualFundHoldingSchema);
 
+// Periodic real-price snapshots for stocks, taken by the background poller
+// below (independent of any user visiting the site) — see getStockChartData
+// for how these get merged into the 1H/1D intraday chart series.
+const stockPriceSnapshotSchema = new mongoose.Schema({
+  symbol: { type: String, required: true, index: true },
+  price:  { type: Number, required: true },
+  ts:     { type: Date,   required: true, default: Date.now },
+});
+stockPriceSnapshotSchema.index({ ts: 1 }, { expireAfterSeconds: 30 * 24 * 3600 }); // auto-expire after 30 days
+const StockPriceSnapshot = mongoose.models.StockPriceSnapshot || mongoose.model('StockPriceSnapshot', stockPriceSnapshotSchema);
+
 // ══════════════════════════════════════════════════════════════════
 //  CACHE
 // ══════════════════════════════════════════════════════════════════
@@ -367,37 +378,101 @@ async function getStockPrice(sym) {
 var RANGE_DAYS = { '1H': 1, '1D': 1, '1W': 7, '1M': 30, '3M': 90, '1Y': 365, '2Y': 730 };
 var NSE_SESSION_MS = (6 * 60 + 15) * 60000; // 9:15 AM -> 3:30 PM IST
 
+// Read our own periodically-stored real prices for a symbol since a given
+// time — see startStockPricePoller() below.
+async function getStoredStockSnapshots(sym, sinceMs) {
+  try {
+    var rows = await StockPriceSnapshot.find({ symbol: sym, ts: { $gte: new Date(sinceMs) } }).sort({ ts: 1 }).lean();
+    return rows.map(function(r){ return { x: r.ts.getTime(), y: r.price }; });
+  } catch (e) { console.error('[stock snapshot read]', sym, e.message); return []; }
+}
+
+// Merge two ascending [{x,y}] series (Yahoo's feed + our own poller
+// snapshots), dropping points within 60s of one another so the two
+// sources don't produce near-duplicate ticks.
+function mergeTimeSeries(a, b) {
+  var all = a.concat(b).sort(function(p, q){ return p.x - q.x; });
+  var out = [];
+  for (var i = 0; i < all.length; i++) {
+    if (out.length && Math.abs(all[i].x - out[out.length - 1].x) < 60000) continue;
+    out.push(all[i]);
+  }
+  return out;
+}
+
 async function getStockChartData(sym, range) {
   if (range === '1H') {
+    var cutoff1 = Date.now() - 3600000;
+    var ownSnaps1 = await getStoredStockSnapshots(sym, cutoff1);
     var y1 = await getYahooChart(sym, '5d', '5m');
     if (y1 && y1.series.length) {
-      var cutoff1 = Date.now() - 3600000;
-      var sliced1 = y1.series.filter(function(p){ return p.t.getTime() >= cutoff1; });
-      return (sliced1.length >= 2 ? sliced1 : y1.series).map(function(p){ return { x: p.t.getTime(), y: p.price }; });
+      var sliced1 = y1.series.filter(function(p){ return p.t.getTime() >= cutoff1; }).map(function(p){ return { x: p.t.getTime(), y: p.price }; });
+      var merged1 = mergeTimeSeries(sliced1, ownSnaps1);
+      if (merged1.length >= 2) return merged1;
+      return y1.series.map(function(p){ return { x: p.t.getTime(), y: p.price }; });
     }
+    if (ownSnaps1.length >= 2) return ownSnaps1;
   }
   if (range === '1D') {
     // Exactly ONE trading session — 9:15 AM to 3:30 PM IST of whichever
     // session is current (today's, if the market has opened today;
     // otherwise the most recently completed one) — never a rolling
     // window that bleeds into an adjacent day's session.
+    var sessionStart = lastISTClockTime(9, 15);
+    var sessionEnd = Math.min(sessionStart.getTime() + NSE_SESSION_MS, Date.now());
+    var ownSnaps2 = await getStoredStockSnapshots(sym, sessionStart.getTime());
     var y2 = await getYahooChart(sym, '5d', '15m');
     if (y2 && y2.series.length) {
-      var sessionStart = lastISTClockTime(9, 15);
-      var sessionEnd = Math.min(sessionStart.getTime() + NSE_SESSION_MS, Date.now());
       var sliced2 = y2.series.filter(function(p){
         var t = p.t.getTime();
         return t >= sessionStart.getTime() && t <= sessionEnd;
-      });
-      if (sliced2.length >= 2) return sliced2.map(function(p){ return { x: p.t.getTime(), y: p.price }; });
+      }).map(function(p){ return { x: p.t.getTime(), y: p.price }; });
+      // Our own poller runs every 5-10 min around the clock (see
+      // startStockPricePoller), so merging it in fills whatever gaps
+      // Yahoo's free/anonymous intraday feed leaves — this is what keeps
+      // the day's chart a real continuous line instead of jumping
+      // straight from the last time someone had the app open to now.
+      var merged2 = mergeTimeSeries(sliced2, ownSnaps2.filter(function(p){ return p.x <= sessionEnd; }));
+      if (merged2.length >= 2) return merged2;
       return y2.series.map(function(p){ return { x: p.t.getTime(), y: p.price }; });
     }
+    if (ownSnaps2.length >= 2) return ownSnaps2;
   }
   var hist = await getStockHistory(sym);
   var days = RANGE_DAYS[range] || 365;
   var cutoff = Date.now() - days * DAY_MS;
   return hist.series.filter(function(p){ return p.t.getTime() >= cutoff; }).map(function(p){ return { x: p.t.getTime(), y: p.price }; });
 }
+
+// Keeps real stock prices flowing in even when nobody has the site open —
+// every 5 minutes, fetch the current price for every distinct symbol any
+// user actually holds and store it. getStockChartData() above then blends
+// these into the 1H/1D charts, so reopening the app after a few hours
+// shows the real path the price took meanwhile rather than a single
+// straight line from the last visit to now.
+var STOCK_POLL_MS = 5 * 60 * 1000;
+var _stockPollerStarted = false;
+
+async function pollAndStoreStockPrices() {
+  try {
+    var symbols = await StockHolding.distinct('symbol');
+    for (var i = 0; i < symbols.length; i++) {
+      var sym = symbols[i];
+      try {
+        var price = await getStockPrice(sym);
+        if (price != null) await StockPriceSnapshot.create({ symbol: sym, price: price, ts: new Date() });
+      } catch (e) { console.error('[stock snapshot]', sym, e.message); }
+    }
+  } catch (e) { console.error('[stock snapshot poll]', e.message); }
+}
+
+function startStockPricePoller() {
+  if (_stockPollerStarted) return;
+  _stockPollerStarted = true;
+  setTimeout(pollAndStoreStockPrices, 15000); // give the DB connection a moment on cold start
+  setInterval(pollAndStoreStockPrices, STOCK_POLL_MS);
+}
+startStockPricePoller();
 
 // Stock search — lets users find the correct symbol instead of relying on
 // a hand-maintained list (fixes tickers that previously showed "—").
@@ -662,7 +737,52 @@ async function getCryptoChart(id, range, symbolHint) {
     }
   }
 
+  // Last resort — for coins that aren't on CoinGecko's chart endpoint
+  // (rate-limited / unrecognized id) nor listed on Kraken or Binance
+  // (typically low-liquidity or newly-listed tokens), try CoinPaprika's
+  // free daily-historical endpoint. This only gives 1-day resolution, but
+  // that's enough to compute Day/Week/Month/Year gains — previously these
+  // coins fell through to an empty array here, which is why their D/W/M
+  // gain chips showed "—" while Year (computed from purchase price, not
+  // this series) still worked.
+  try {
+    var paprikaId = await guessCoinPaprikaId(id, symbolHint);
+    if (paprikaId) {
+      var lookbackDays = Math.min(parseInt(days, 10) || 30, 1825);
+      var start = new Date(Date.now() - lookbackDays * 86400000).toISOString().slice(0, 10);
+      var rP = await fetch('https://api.coinpaprika.com/v1/tickers/' + paprikaId + '/historical?start=' + start + '&interval=1d');
+      if (rP.ok) {
+        var dP = await rP.json();
+        if (Array.isArray(dP) && dP.length > 1) {
+          rate = rate || await getUSDINRRate();
+          return dP.map(function(p){ return { x: new Date(p.timestamp).getTime(), y: parseFloat((p.price * rate).toFixed(4)) }; });
+        }
+      }
+    }
+  } catch (e) { console.error('[coinpaprika chart]', id, e.message); }
+
   return [];
+}
+
+// Resolves a CoinGecko-style id (or a bare symbol hint) to a CoinPaprika
+// coin id ("btc-bitcoin" style) via CoinPaprika's own search, preferring
+// an exact ticker-symbol match when we have one to go on.
+async function guessCoinPaprikaId(id, symbolHint) {
+  try {
+    var r = await fetch('https://api.coinpaprika.com/v1/search?q=' + encodeURIComponent(symbolHint || id) + '&c=currencies&limit=10');
+    if (r.ok) {
+      var d = await r.json();
+      var list = (d && d.currencies) || [];
+      if (list.length) {
+        if (symbolHint) {
+          var exact = list.find(function(c){ return (c.symbol || '').toLowerCase() === symbolHint.toLowerCase(); });
+          if (exact) return exact.id;
+        }
+        return list[0].id;
+      }
+    }
+  } catch (e) { console.error('[coinpaprika id lookup]', id, e.message); }
+  return null;
 }
 
 // 2y daily series used for period-gain math (independent of chart "range" UI)
@@ -891,7 +1011,17 @@ async function getMFChartData(code, range) {
   var hist = await getMFHistory(code);
   var days = RANGE_DAYS[range] || 365;
   var cutoff = Date.now() - days * DAY_MS;
-  return hist.series.filter(function(p){ return p.t.getTime() >= cutoff; }).map(function(p){ return { x: p.t.getTime(), y: p.price }; });
+  var filtered = hist.series.filter(function(p){ return p.t.getTime() >= cutoff; });
+  // MF NAVs only update once per trading day, so a 1H/1D window can
+  // easily contain 0 or 1 data points (weekend, today's NAV not yet
+  // published, etc.). Chart.js needs at least 2 points to draw a line —
+  // rather than render nothing, fall back to the most recent known NAV
+  // points so the mutual-fund chart always has something to plot instead
+  // of going blank whenever the selected range happens to be 1H/1D.
+  if (filtered.length < 2 && hist.series.length >= 2) {
+    return hist.series.slice(-2).map(function(p){ return { x: p.t.getTime(), y: p.price }; });
+  }
+  return filtered.map(function(p){ return { x: p.t.getTime(), y: p.price }; });
 }
 
 // Walk a SIP forward from sipStartDate, one instalment on sipDay of every
