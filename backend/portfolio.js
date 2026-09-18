@@ -91,8 +91,32 @@ function setCache(key, val) { _cache[key] = { val: val, ts: Date.now() }; }
 //  SHARED HELPERS — date math & the P&L engine
 // ══════════════════════════════════════════════════════════════════
 var DAY_MS = 86400000;
+var IST_OFFSET_MS = (5 * 60 + 30) * 60000; // IST is a fixed UTC+5:30, no DST
 
 function daysAgo(n) { return new Date(Date.now() - n * DAY_MS); }
+
+// The most recent occurrence (as a real UTC instant) of a given IST
+// wall-clock time (hour:minute) that is at/before "now" — e.g. hour=9,
+// minute=15 gives "today's 9:15 AM IST" once that's passed, or
+// "yesterday's 9:15 AM IST" before it happens today. This is what makes
+// a "day" figure anchored to market open persist unchanged all the way
+// through to the next session's open, rather than rolling every 24h.
+function lastISTClockTime(hour, minute) {
+  var now = new Date();
+  var nowIST = new Date(now.getTime() + IST_OFFSET_MS);
+  var y = nowIST.getUTCFullYear(), m = nowIST.getUTCMonth(), d = nowIST.getUTCDate();
+  var todayAnchorIST = new Date(Date.UTC(y, m, d, hour, minute, 0));
+  var todayAnchorUTC = new Date(todayAnchorIST.getTime() - IST_OFFSET_MS);
+  if (now.getTime() >= todayAnchorUTC.getTime()) return todayAnchorUTC;
+  return new Date(todayAnchorUTC.getTime() - DAY_MS);
+}
+
+// Calendar date string (YYYY-MM-DD) as seen from IST, not the server's
+// UTC clock — matters near midnight so "yesterday" means yesterday in
+// India, not wherever the server happens to be.
+function istDateString(date) {
+  return new Date(date.getTime() + IST_OFFSET_MS).toISOString().split('T')[0];
+}
 
 // Given an ascending series [{t: Date, price: Number}], find the price
 // at-or-before a target date (last known price on/prior to that date).
@@ -107,28 +131,44 @@ function priceOnOrBefore(series, targetDate) {
   return best ? best.price : (series[0] ? series[0].price : null);
 }
 
+// Find the price at-or-just-after a target date — used for "since market
+// open" anchors, where we want the first known tick AT/AFTER open, not
+// the last one before it.
+function priceOnOrAfter(series, targetDate) {
+  if (!series || !series.length) return null;
+  var t = targetDate.getTime();
+  for (var i = 0; i < series.length; i++) {
+    if (series[i].t.getTime() >= t) return series[i].price;
+  }
+  return series[series.length - 1].price;
+}
+
 // Given an ascending series and a "units held as of date" function,
 // compute mark-to-market gain over a period: units held at the start
 // of the period × (price now − price then).
 //
-// If the holding is younger than the requested period (e.g. bought 5
-// months ago, asked for the 1-year figure), the naive anchor date falls
-// before the holding existed — which used to report a flat ₹0 "gain",
-// which is misleading. Instead we clamp the anchor to the holding's
-// inception point and use the *actual* buy price/units from inception,
-// so a short-lived holding's "Year" gain gracefully equals its "Overall"
-// gain (exactly like a real brokerage app), rather than showing 0.
-function periodGain(series, currentPrice, unitsAsOfFn, periodDays, inception) {
+// anchorDate is the explicit point in time to measure from (callers
+// decide what that means per period — see computeGainsForHolding).
+// anchorPriceOverride lets a caller supply the exact anchor price
+// directly (e.g. a stock's actual market-open tick) instead of having
+// it derived from `series`, which may be too coarse (daily closes only)
+// for that purpose.
+//
+// If the holding is younger than the anchor (e.g. bought 5 months ago,
+// asked for the 1-year figure), the anchor falls before the holding
+// existed — which used to report a flat ₹0 "gain", which is misleading.
+// Instead we clamp to the holding's inception point and use the *actual*
+// buy price/units from inception, so a short-lived holding's "Year" gain
+// gracefully equals its "Overall" gain, rather than showing 0.
+function periodGain(series, currentPrice, unitsAsOfFn, anchorDate, inception, anchorPriceOverride) {
   if (currentPrice == null) return { abs: null, pct: null, base: null };
-  var anchorDate = daysAgo(periodDays);
   var priceThen, unitsThen;
 
   if (inception && anchorDate.getTime() < inception.date.getTime()) {
-    // Holding didn't exist yet at the naive anchor — clamp to inception.
     priceThen = inception.price;
     unitsThen = inception.units;
   } else {
-    priceThen = priceOnOrBefore(series, anchorDate);
+    priceThen = anchorPriceOverride != null ? anchorPriceOverride : priceOnOrBefore(series, anchorDate);
     unitsThen = unitsAsOfFn(anchorDate);
   }
 
@@ -143,12 +183,19 @@ function periodGain(series, currentPrice, unitsAsOfFn, periodDays, inception) {
   };
 }
 
-function computeGainsForHolding(series, currentPrice, unitsAsOfFn, inception) {
+// dayAnchor (optional): { date, price? } — how "Day" should be measured
+// for this asset type. Omit it to fall back to a plain rolling 24h
+// window (still used for mutual funds and, indirectly, utility — see
+// their sections below). Week/Month/Year always stay as rolling
+// 7/30/365-day windows regardless of asset type.
+function computeGainsForHolding(series, currentPrice, unitsAsOfFn, inception, dayAnchor) {
+  var dayAnchorDate  = dayAnchor ? dayAnchor.date : daysAgo(1);
+  var dayAnchorPrice = dayAnchor ? dayAnchor.price : undefined;
   return {
-    day:     periodGain(series, currentPrice, unitsAsOfFn, 1, inception),
-    week:    periodGain(series, currentPrice, unitsAsOfFn, 7, inception),
-    month:   periodGain(series, currentPrice, unitsAsOfFn, 30, inception),
-    year:    periodGain(series, currentPrice, unitsAsOfFn, 365, inception),
+    day:     periodGain(series, currentPrice, unitsAsOfFn, dayAnchorDate, inception, dayAnchorPrice),
+    week:    periodGain(series, currentPrice, unitsAsOfFn, daysAgo(7), inception),
+    month:   periodGain(series, currentPrice, unitsAsOfFn, daysAgo(30), inception),
+    year:    periodGain(series, currentPrice, unitsAsOfFn, daysAgo(365), inception),
     overall: inception && currentPrice != null
       ? (function(){
           var abs = inception.units * (currentPrice - inception.price);
@@ -273,6 +320,24 @@ async function getStockHistory(sym) {
   var y = await getYahooChart(sym, '2y', '1d');
   if (y && y.series.length) { setCache(ck, y); return y; }
   return { series: [], live: null };
+}
+
+// "Day" for a stock means since NSE's 9:15 AM IST market open — not a
+// rolling 24h window — persisting unchanged through the close and into
+// the evening until the next session opens. The 2y daily-close series
+// above is too coarse for this (it has no "open" tick), so this pulls a
+// short intraday series (15-min candles, last 5 days) and finds the
+// first tick at/after the correct session's open.
+async function getStockDayAnchorPrice(sym) {
+  var ck = 'sda:' + sym;
+  var cached = getCache(ck, 300000); // 5 min
+  if (cached !== null) return cached;
+  var y = await getYahooChart(sym, '5d', '15m');
+  if (!y || !y.series.length) return null;
+  var anchor = lastISTClockTime(9, 15);
+  var price = priceOnOrAfter(y.series, anchor);
+  if (price != null) setCache(ck, price);
+  return price;
 }
 
 async function getStockPrice(sym) {
@@ -691,7 +756,7 @@ var PERMANENT_TTL = 315360000000;
 
 async function getMetalHistoricalSpot(type, date) {
   var sym = METAL_SYMBOL[type];
-  var dateStr = date.toISOString().split('T')[0];
+  var dateStr = istDateString(date);
   var ck = 'mh:' + type + ':' + dateStr;
   var cached = getCache(ck, PERMANENT_TTL);
   if (cached !== null) return cached;
@@ -1121,17 +1186,22 @@ router.get('/gains', requireUser, async function(req, res) {
     ]);
     var stocks = lists[0], crypto = lists[1], utility = lists[2], mfs = lists[3];
 
-    // ── Stocks ──
+    // ── Stocks ── "Day" = since today's 9:15 AM IST market open (not a
+    // rolling 24h window), persisting until the next session opens.
     var stockGains = await Promise.all(stocks.map(async function(h) {
       var hist = await getStockHistory(h.symbol);
       var current = hist.live;
       var purchaseTs = new Date(h.purchaseDate).getTime();
       var unitsAsOf = function(d) { return d.getTime() >= purchaseTs ? h.quantity : 0; };
       var inception = { date: new Date(h.purchaseDate), price: h.buyPrice, units: h.quantity };
-      return { id: String(h._id), gains: computeGainsForHolding(hist.series, current, unitsAsOf, inception), currentPrice: current };
+      var dayAnchorPrice = await getStockDayAnchorPrice(h.symbol);
+      var dayAnchor = dayAnchorPrice != null ? { date: lastISTClockTime(9, 15), price: dayAnchorPrice } : null;
+      return { id: String(h._id), gains: computeGainsForHolding(hist.series, current, unitsAsOf, inception, dayAnchor), currentPrice: current };
     }));
 
-    // ── Crypto ──
+    // ── Crypto ── "Day" = since 12:00 AM IST today (calendar day), not a
+    // rolling 24h window. Reuses the already-fetched history series (no
+    // extra API call) — its own daily-ish granularity is fine for this.
     var cryptoGains = await Promise.all(crypto.map(async function(h) {
       var series = await getCryptoHistory(h.coinId, h.symbol);
       var current = await getCryptoPrice(h.coinId, h.symbol);
@@ -1139,10 +1209,16 @@ router.get('/gains', requireUser, async function(req, res) {
       var purchaseTs = new Date(h.purchaseDate).getTime();
       var unitsAsOf = function(d) { return d.getTime() >= purchaseTs ? h.quantity * lev : 0; };
       var inception = { date: new Date(h.purchaseDate), price: h.buyPrice, units: h.quantity * lev };
-      return { id: String(h._id), gains: computeGainsForHolding(series, current, unitsAsOf, inception), currentPrice: current };
+      var dayAnchor = { date: lastISTClockTime(0, 0) };
+      return { id: String(h._id), gains: computeGainsForHolding(series, current, unitsAsOf, inception, dayAnchor), currentPrice: current };
     }));
 
-    // ── Utility (gold/silver/platinum) ──
+    // ── Utility (gold/silver/platinum) ── "Day" = vs yesterday's closing
+    // rate (IST calendar date) — metals have no single "market open" time
+    // the way NSE does, so a previous-close comparison is what "last
+    // closing NAV" means here. getMetalHistoricalSpot already resolves
+    // dates against the IST calendar (see istDateString), so the default
+    // rolling-1-day anchor already lines up correctly — no override needed.
     var utilGains = await Promise.all(utility.map(async function(h) {
       var series = await getMetalHistory(h.assetId || 'gold');
       var current = await getMetalPrice(h.assetId || 'gold');
