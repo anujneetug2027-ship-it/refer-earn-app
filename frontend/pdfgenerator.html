@@ -68,7 +68,7 @@ function sendReport(data){
  document.getElementById('previewLabel').textContent='Preview • '+(data.month||monthNow());
 }
 async function load(){try{const override=parsedOverride();const d=override||await liveData();if(!d.trend)d.trend=[];d._generator={generatedAt:new Date().toISOString()};window.reportData=d;sendReport(d);status('Report loaded. Preview is using the same portfolio endpoints as portfolio.html.','ok')}catch(e){console.error(e);status('<span class="danger">'+e.message+'</span>','danger')}}
-async function waitForFrame(){return new Promise((resolve,reject)=>{const ready=()=>{if(frame.contentDocument&&frame.contentDocument.querySelectorAll('.report-page').length){clearInterval(timer);resolve()}else if(Date.now()-started>30000){clearInterval(timer);reject(new Error('Report preview did not finish rendering.'))}};const started=Date.now();const timer=setInterval(ready,150);ready()})}
+async function waitForFrame(){return new Promise((resolve,reject)=>{const started=Date.now();const ready=()=>{const doc=frame.contentDocument;const pages=doc&&doc.querySelectorAll('.report-page').length;const chartsReady=frame.contentWindow&&frame.contentWindow.__AMBICASHELF_CHARTS_READY===true;if(pages&&chartsReady){clearInterval(timer);resolve()}else if(Date.now()-started>90000){clearInterval(timer);reject(new Error(chartsReady?'Report preview did not finish rendering.':'Report chart data did not finish loading.'))}};const timer=setInterval(ready,200);ready()})}
 async function waitForReportAssets(){
  const doc=frame.contentDocument;
  if(!doc)throw new Error('Report document is unavailable.');
@@ -108,7 +108,7 @@ async function makePDF(){
  const blob=await r.blob();const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=(payload.name.replace(/[^\w-]/g,'_')||'AmbikaShelf_Monthly_Report')+'.pdf';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);status('PDF generated successfully. '+pages.length+' A4 pages were sent to /api/pdf/create.','ok');
 }
 document.getElementById('load').onclick=load;document.getElementById('preview').onclick=()=>{if(window.reportData)sendReport(window.reportData);else load()};document.getElementById('pdf').onclick=async()=>{try{await makePDF()}catch(e){console.error(e);status('<span class="danger">'+e.message+'</span>','danger')}};document.getElementById('print').onclick=async()=>{try{if(!window.reportData)await load();await waitForFrame();frame.contentWindow.focus();frame.contentWindow.print()}catch(e){status('<span class="danger">'+e.message+'</span>','danger')}};
-window.addEventListener('message',e=>{if(e.data&&e.data.type==='AMBICASHELF_REPORT_READY')status('Report ready.','ok')});
+window.addEventListener('message',e=>{if(e.data&&e.data.type==='AMBICASHELF_REPORT_READY')status(e.data.chartsReady?'Report ready — charts loaded.':'Report ready.','ok')});
 load();
 })();
 </script>
