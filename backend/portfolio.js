@@ -333,42 +333,56 @@ async function searchStocks(q) {
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  CRYPTO — Binance PRIMARY, CoinGecko secondary, CoinPaprika tertiary
+//  CRYPTO — CoinGecko PRIMARY, Kraken secondary, Binance tertiary,
+//  CoinPaprika last-resort (price only)
 //
-//  Why Binance first: CoinGecko's keyless public API actively 403s
-//  requests coming from several cloud/hosting IP ranges (confirmed for
-//  Cloudflare Workers, and Render's shared IPs hit the same wall) —
-//  that's why crypto was completely dead ("nothing working"). CoinCap's
-//  free v2 API (the original primary) was retired outright in 2025.
-//  Binance's public *market data* endpoints (no auth, no key) are far
-//  more permissive from server IPs and also give real historical
-//  candles for free, which CoinPaprika's free tier does NOT (historical
-//  data there is a paid-only feature) — so Binance covers both price
-//  and charts, CoinGecko is the fallback when a coin isn't on Binance,
-//  and CoinPaprika only ever supplies a last-resort *current* price.
+//  Binance was tried as primary previously, which was the wrong call:
+//  Binance's public market-data API enforces a hard geo-block ("Service
+//  unavailable from a restricted location") against US-region IPs, and
+//  Render's servers are commonly US-hosted — so it would work briefly
+//  (whatever cached values survived) and then go completely blank once
+//  every call started hitting the block, which matches "working
+//  yesterday, blank today" exactly. Binance is now just an opportunistic
+//  extra fallback, never depended on.
+//
+//  CoinGecko's keyless API is the most broadly-compatible free option
+//  (it does 403 a *few* cloud IP ranges like Cloudflare Workers, but
+//  that's narrower than Binance's blanket US geo-block) — so it's back
+//  to being primary. Kraken sits right behind it: free, no key, not
+//  known for geo-blocking cloud hosts, and gives real historical OHLC
+//  candles (unlike CoinPaprika's free tier, which is current-price only).
 // ══════════════════════════════════════════════════════════════════
 var CG_HEADERS = { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' };
-var BINANCE_HEADERS = { 'Accept': 'application/json' };
+var EXCHANGE_HEADERS = { 'Accept': 'application/json' };
 
-// Known CoinGecko-id → Binance trading symbol map for the coins this app
-// ships with by default. Anything else (a coin found via search) gets a
-// *guessed* symbol from its ticker (e.g. "PEPE" → "PEPEUSDT") and we just
-// try it — Binance 400s harmlessly if that guess doesn't exist, and we
-// fall through to CoinGecko/CoinPaprika.
+// Kraken uses its own quirky pair codes (BTC is "XBT") — map the coins
+// this app ships with; anything else guesses SYMBOL+"USD" and just tries.
+var KRAKEN_PAIR = {
+  'bitcoin': 'XBTUSD', 'ethereum': 'ETHUSD', 'solana': 'SOLUSD',
+  'dogecoin': 'DOGEUSD', 'chainlink': 'LINKUSD',
+};
 var BINANCE_SYMBOL = {
   'bitcoin': 'BTCUSDT', 'ethereum': 'ETHUSDT', 'solana': 'SOLUSDT',
   'dogecoin': 'DOGEUSDT', 'chainlink': 'LINKUSDT', 'bitget-token': 'BGBUSDT',
 };
 
+function guessKrakenPair(id, symbolHint) {
+  if (KRAKEN_PAIR[id]) return KRAKEN_PAIR[id];
+  if (symbolHint) {
+    var sym = symbolHint.toUpperCase();
+    if (sym === 'BTC') sym = 'XBT';
+    return sym + 'USD';
+  }
+  return null;
+}
 function guessBinanceSymbol(id, symbolHint) {
   if (BINANCE_SYMBOL[id]) return BINANCE_SYMBOL[id];
   if (symbolHint) return symbolHint.toUpperCase().replace(/USDT$/, '') + 'USDT';
   return null;
 }
 
-// USDT ≈ USD; convert via a real USD/INR rate. Frankfurter (ECB-backed,
-// free, keyless, rarely blocked) is primary; CoinGecko's tether/inr pair
-// is the fallback if Frankfurter is ever unreachable.
+// USD/INR via Frankfurter (ECB-backed, free, keyless, rarely blocked);
+// CoinGecko's tether/inr pair as fallback.
 async function getUSDINRRate() {
   var cached = getCache('usdinr', 3600000);
   if (cached) return cached;
@@ -391,9 +405,48 @@ async function getUSDINRRate() {
   return 88; // last-resort static fallback
 }
 
+async function getKrakenPriceUSD(pair) {
+  try {
+    var r = await fetch('https://api.kraken.com/0/public/Ticker?pair=' + encodeURIComponent(pair), { headers: EXCHANGE_HEADERS });
+    if (r.ok) {
+      var d = await r.json();
+      if (d && (!d.error || !d.error.length) && d.result) {
+        var key = Object.keys(d.result)[0];
+        var last = key && d.result[key].c && d.result[key].c[0];
+        if (last) return parseFloat(last);
+      }
+    }
+  } catch (e) { console.error('[kraken price]', pair, e.message); }
+  return null;
+}
+
+var KRAKEN_INTERVAL_CFG = {
+  '1H': 1, '1D': 15, '1W': 60, '1M': 240, '3M': 1440, '1Y': 1440, '2Y': 1440,
+};
+
+async function getKrakenKlinesUSD(pair, range) {
+  var interval = KRAKEN_INTERVAL_CFG[range] || 15;
+  try {
+    var url = 'https://api.kraken.com/0/public/OHLC?pair=' + encodeURIComponent(pair) + '&interval=' + interval;
+    var r = await fetch(url, { headers: EXCHANGE_HEADERS });
+    if (r.ok) {
+      var d = await r.json();
+      if (d && (!d.error || !d.error.length) && d.result) {
+        var key = Object.keys(d.result).find(function(k){ return k !== 'last'; });
+        var rows = key && d.result[key];
+        if (Array.isArray(rows) && rows.length > 1) {
+          // row: [time, open, high, low, close, vwap, volume, count]
+          return rows.map(function(row){ return { t: row[0] * 1000, priceUsd: parseFloat(row[4]) }; });
+        }
+      }
+    }
+  } catch (e) { console.error('[kraken klines]', pair, e.message); }
+  return null;
+}
+
 async function getBinancePriceUSDT(symbol) {
   try {
-    var r = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=' + encodeURIComponent(symbol), { headers: BINANCE_HEADERS });
+    var r = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=' + encodeURIComponent(symbol), { headers: EXCHANGE_HEADERS });
     if (r.ok) {
       var d = await r.json();
       if (d && d.price) return parseFloat(d.price);
@@ -414,11 +467,10 @@ async function getBinanceKlinesUSDT(symbol, range) {
   try {
     var url = 'https://api.binance.com/api/v3/klines?symbol=' + encodeURIComponent(symbol)
       + '&interval=' + cfg.interval + '&limit=' + cfg.limit;
-    var r = await fetch(url, { headers: BINANCE_HEADERS });
+    var r = await fetch(url, { headers: EXCHANGE_HEADERS });
     if (r.ok) {
       var d = await r.json();
       if (Array.isArray(d) && d.length > 1) {
-        // kline row: [openTime, open, high, low, close, volume, closeTime, ...]
         return d.map(function(row){ return { t: row[0], priceUsdt: parseFloat(row[4]) }; });
       }
     }
@@ -431,29 +483,39 @@ async function getCryptoPrice(id, symbolHint) {
   var cached = getCache(ck, 60000);
   if (cached !== null) return cached;
 
-  var binSym = guessBinanceSymbol(id, symbolHint);
-  if (binSym) {
-    var usdt = await getBinancePriceUSDT(binSym);
-    if (usdt) {
-      var rate = await getUSDINRRate();
-      var price = usdt * rate;
-      setCache(ck, price);
-      _stickyGood[ck] = price;
-      return price;
-    }
-  }
-
   try {
     var url = 'https://api.coingecko.com/api/v3/simple/price?ids=' + encodeURIComponent(id) + '&vs_currencies=inr';
     var r = await fetch(url, { headers: CG_HEADERS });
     if (r.ok) {
       var d = await r.json();
-      if (d && d[id] && d[id].inr) { setCache(ck, d[id].inr); _stickyGood[ck] = d[id].inr; return d[id].inr; }
+      if (d && d[id] && d[id].inr) { setCache(ck, d[id].inr); return d[id].inr; }
     }
   } catch (e) { console.error('[coingecko price]', id, e.message); }
 
+  var rate = null;
+  var krakenPair = guessKrakenPair(id, symbolHint);
+  if (krakenPair) {
+    var usdK = await getKrakenPriceUSD(krakenPair);
+    if (usdK) {
+      rate = rate || await getUSDINRRate();
+      var priceK = usdK * rate;
+      setCache(ck, priceK);
+      return priceK;
+    }
+  }
+
+  var binSym = guessBinanceSymbol(id, symbolHint);
+  if (binSym) {
+    var usdB = await getBinancePriceUSDT(binSym);
+    if (usdB) {
+      rate = rate || await getUSDINRRate();
+      var priceB = usdB * rate;
+      setCache(ck, priceB);
+      return priceB;
+    }
+  }
+
   try {
-    // CoinPaprika ids are "btc-bitcoin" style; try a couple of common guesses.
     var guesses = symbolHint ? [symbolHint.toLowerCase() + '-' + id] : [];
     var r3 = await fetch('https://api.coinpaprika.com/v1/search?q=' + encodeURIComponent(id) + '&c=currencies&limit=1');
     if (r3.ok) {
@@ -465,38 +527,23 @@ async function getCryptoPrice(id, symbolHint) {
       var r4 = await fetch('https://api.coinpaprika.com/v1/tickers/' + guesses[i] + '?quotes=USD');
       if (r4.ok) {
         var d4 = await r4.json();
-        var usd = d4 && d4.quotes && d4.quotes.USD && d4.quotes.USD.price;
-        if (usd) {
-          var rate2 = await getUSDINRRate();
-          var price2 = usd * rate2;
-          setCache(ck, price2);
-          _stickyGood[ck] = price2;
-          return price2;
+        var usdP = d4 && d4.quotes && d4.quotes.USD && d4.quotes.USD.price;
+        if (usdP) {
+          rate = rate || await getUSDINRRate();
+          var priceP = usdP * rate;
+          setCache(ck, priceP);
+          return priceP;
         }
       }
     }
   } catch (e) { console.error('[coinpaprika price]', id, e.message); }
 
-  // Every provider failed (rate-limited, geo-blocked cloud IP, transient
-  // outage, etc.) — surface the last real price we saw instead of null,
-  // so the crypto section shows stale-but-real data rather than going
-  // completely blank the way it did before.
-  console.error('[crypto price] all providers failed for', id, '— using last known good value if any');
-  return _stickyGood[ck] != null ? _stickyGood[ck] : null;
+  return null;
 }
 
 var CG_CHART_DAYS = { '1H':'1','1D':'1','1W':'7','1M':'30','3M':'90','1Y':'365','2Y':'730' };
 
 async function getCryptoChart(id, range, symbolHint) {
-  var binSym = guessBinanceSymbol(id, symbolHint);
-  if (binSym) {
-    var klines = await getBinanceKlinesUSDT(binSym, range);
-    if (klines) {
-      var rate = await getUSDINRRate();
-      return klines.map(function(k){ return { x: k.t, y: parseFloat((k.priceUsdt * rate).toFixed(4)) }; });
-    }
-  }
-
   var days = CG_CHART_DAYS[range] || '1';
   try {
     var url = 'https://api.coingecko.com/api/v3/coins/' + encodeURIComponent(id) + '/market_chart?vs_currency=inr&days=' + days;
@@ -506,6 +553,26 @@ async function getCryptoChart(id, range, symbolHint) {
       if (d && d.prices && d.prices.length > 1) return d.prices.map(function(p){ return { x: p[0], y: p[1] }; });
     }
   } catch (e) { console.error('[coingecko chart]', id, e.message); }
+
+  var rate = null;
+  var krakenPair = guessKrakenPair(id, symbolHint);
+  if (krakenPair) {
+    var klinesK = await getKrakenKlinesUSD(krakenPair, range);
+    if (klinesK) {
+      rate = rate || await getUSDINRRate();
+      return klinesK.map(function(k){ return { x: k.t, y: parseFloat((k.priceUsd * rate).toFixed(4)) }; });
+    }
+  }
+
+  var binSym = guessBinanceSymbol(id, symbolHint);
+  if (binSym) {
+    var klinesB = await getBinanceKlinesUSDT(binSym, range);
+    if (klinesB) {
+      rate = rate || await getUSDINRRate();
+      return klinesB.map(function(k){ return { x: k.t, y: parseFloat((k.priceUsdt * rate).toFixed(4)) }; });
+    }
+  }
+
   return [];
 }
 
@@ -516,17 +583,11 @@ async function getCryptoHistory(id, symbolHint) {
   if (cached) return cached;
   var data = await getCryptoChart(id, '2Y', symbolHint);
   var series = data.map(function(p){ return { t: new Date(p.x), price: p.y }; });
-  if (series.length) { setCache(ck, series); _stickyGood[ck] = series; return series; }
-  // All chart providers failed this round — fall back to the last series
-  // we successfully fetched rather than an empty array, which is what
-  // made the "coin section" (and any chart depending on it) go blank on
-  // a transient outage instead of just showing slightly-stale data.
-  return _stickyGood[ck] || series;
+  if (series.length) setCache(ck, series);
+  return series;
 }
 
-// Crypto search — CoinGecko's keyless /search endpoint primary (works for
-// most requests despite the occasional cloud-IP 403), CoinPaprika's free
-// /search as fallback so the feature still works if CoinGecko is blocked.
+// Crypto search — CoinGecko primary, CoinPaprika fallback.
 async function searchCrypto(q) {
   try {
     var url = 'https://api.coingecko.com/api/v3/search?query=' + encodeURIComponent(q);
