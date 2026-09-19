@@ -12,14 +12,14 @@ const User = require('./models/User');
 const Referral = require('./models/Referral');
 const NotificationSubscriber = require('./models/NotificationSubscriber');
 const sendWelcomeMail = require('./welcomeMail');
-const { sendEmail } = require("./emailService");
+const { sendEmail, startMonthlyReportScheduler, registerMonthlyReportRoutes } = require("./emailService");
 const walletRoutes = require('./wallet');
 const http = require("http");
 const { Server } = require("socket.io");
 const chatSocket = require("./chatSocket");
 const fetch = require('node-fetch');
 const app = express();
- 
+
 // ---------- MIDDLEWARE ----------
 // ✅ Body parsers MUST come before ANY routes
 app.use(cors({ origin: '*', credentials: true }));
@@ -29,9 +29,7 @@ app.use(bodyParser.json());                       // ← MOVED UP ✅
 app.use(bodyParser.urlencoded({ extended: true })); // ← MOVED UP ✅
 // ══════════════════════════════════════════════════════════════
 
-// ═════════════════════// line 15
-
-(); })═════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════
 
 const Razorpay = require('razorpay');
 
@@ -174,6 +172,10 @@ app.use('/api/portfolio', (req, res, next) => {
   console.log('Portfolio route hit:', req.method, req.path);
   next();
 }, portfolioRoutes);
+
+// Monthly report subscription + protected monthly report trigger routes.
+registerMonthlyReportRoutes(app);
+
 // ── PASTE THIS ROUTE BLOCK into server.js (after your middleware section) ──
 
 app.post('/api/pdf/create', async (req, res) => {
@@ -326,8 +328,6 @@ app.post('/api/pdf/create', async (req, res) => {
 });
 
 
-
-
 app.use('/api/wallet', walletRoutes);             // ← MOVED DOWN ✅
 
 // ---------- Sitemaps ----------
@@ -343,7 +343,10 @@ app.use(express.static(path.join(__dirname, '../frontend')));
 
 // ---------- MONGO CONNECTION ----------
 mongoose.connect(process.env.MONGO_URI)
-  .then(() => console.log('✅ MongoDB connected'))
+  .then(() => {
+    console.log('✅ MongoDB connected');
+    startMonthlyReportScheduler();
+  })
   .catch(err => console.error('MongoDB Error:', err));
 
 // ---------- HELPERS ----------
