@@ -35,7 +35,11 @@ function getReturnColor(value) {
 function buildMonthlyReportEmail(data = {}) {
   const name = esc(data.name || "there");
   const month = esc(data.month || "");
-  const monthlyReturnPercent = esc(data.monthlyReturnPercent ?? "0.00%");
+  let rawMonthlyReturn = data.monthlyReturnPercent ?? "0.00%";
+  if (typeof rawMonthlyReturn === "number") rawMonthlyReturn = rawMonthlyReturn.toFixed(2);
+  rawMonthlyReturn = String(rawMonthlyReturn).trim();
+  if (rawMonthlyReturn && !rawMonthlyReturn.endsWith("%")) rawMonthlyReturn += "%";
+  const monthlyReturnPercent = esc(rawMonthlyReturn);
   const monthlyReturnColor = esc(data.monthlyReturnColor || getReturnColor(data.monthlyReturnPercent));
   const currentYear = esc(data.currentYear || new Date().getFullYear());
   const supportEmail = esc(data.supportEmail || "support@ambikashelf.in");
@@ -49,30 +53,51 @@ function buildMonthlyReportEmail(data = {}) {
 <title>AmbikaShelf Portfolio Manager</title>
 <!--[if mso]><style>table{border-collapse:collapse!important}td{font-family:Arial,Helvetica,sans-serif!important}</style><![endif]-->
 <style>
-html,body{margin:0!important;padding:0!important;width:100%!important;background:#eaf5ff;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%}
-body{font-family:Arial,Helvetica,sans-serif}table{border-spacing:0;border-collapse:collapse}td{border-collapse:collapse}img{border:0;outline:none;text-decoration:none;display:block;max-width:100%;height:auto}a{text-decoration:none}.wrapper{width:100%;background:#eaf5ff}.container{width:100%;max-width:660px;margin:0 auto}
+html,body{margin:0!important;padding:0!important;width:100%!important;background:#eaf5ff;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;overflow-x:hidden}
+body{font-family:Arial,Helvetica,sans-serif}table{border-spacing:0;border-collapse:collapse;max-width:100%}td{border-collapse:collapse}img{border:0;outline:none;text-decoration:none;display:block;max-width:100%;height:auto}a{text-decoration:none}.wrapper{width:100%;background:#eaf5ff}.container{width:100%;max-width:660px;margin:0 auto}.social-icon{display:inline-block;width:30px;height:30px;line-height:30px;border:1px solid #4d789e;border-radius:50%;text-align:center;color:#fff;font-family:Arial,Helvetica,sans-serif;font-size:12px;font-weight:bold;margin-left:4px}
 .hero-title{font-family:Georgia,"Times New Roman",serif;font-size:39px;line-height:40px;font-weight:700;letter-spacing:-1.4px}.section-title{font-family:Georgia,"Times New Roman",serif;font-size:21px;line-height:28px;font-weight:700}.body-text{font-size:14px;line-height:24px}.snapshot-return{font-size:33px;line-height:40px;font-weight:800}.asset-title{font-size:13px;line-height:18px;font-weight:700}.asset-text{font-size:11px;line-height:17px}
-@media screen and (max-width:680px){.container{width:100%!important}.mobile-padding{padding-left:20px!important;padding-right:20px!important}.hero-title{font-size:34px!important;line-height:36px!important}.snapshot-return{font-size:28px!important}.stack{display:block!important;width:100%!important}.stack-padding{padding-bottom:10px!important}.mobile-center{text-align:center!important}}
+@media screen and (max-width:680px){.container{width:100%!important;max-width:100%!important}.mobile-padding{padding-left:20px!important;padding-right:20px!important}.hero-title{font-size:27px!important;line-height:29px!important;letter-spacing:-.8px!important}.snapshot-return{font-size:28px!important}.stack{display:block!important;width:100%!important}.stack-padding{padding-bottom:10px!important}.mobile-center{text-align:center!important}.header-logo{width:88px!important;max-width:88px!important}.header-growth{width:100%!important;max-width:100%!important;margin:0!important}.header-tagline{font-size:9px!important;line-height:13px!important}}
 </style>
 </head>
 <body>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="wrapper"><tr><td align="center" style="padding:16px 8px 35px">
-<table role="presentation" width="660" cellpadding="0" cellspacing="0" border="0" class="container" style="width:100%;max-width:660px">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="container" style="width:100%;max-width:660px">
 
 <!-- HEADER -->
 <tr><td style="background:#062b59;background:linear-gradient(135deg,#041d3d 0%,#063d78 55%,#0874c9 100%);border-radius:22px 22px 0 0;overflow:hidden">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
-<tr><td class="mobile-padding" style="padding:22px 32px 4px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
-<td align="left"><a href="https://ambikashelf.in" target="_blank"><img src="https://ambikashelf.in/icons/ambikashelf.png" alt="AmbikaShelf" width="145" style="width:145px;max-width:145px"></a></td>
-<td align="right" style="color:#c8e4fa;font-size:10px;line-height:15px;letter-spacing:.8px;text-transform:uppercase">Your Wealth<br><strong style="color:#fff">Our Priority</strong></td>
-</tr></table></td></tr>
-<tr><td class="mobile-padding" style="padding:22px 32px 10px"><div class="hero-title" style="color:#fff">Portfolio<br>Manager</div><div style="color:#b9ddff;font-size:13px;line-height:20px;margin-top:9px">Smarter insights for a brighter tomorrow.</div></td></tr>
-<tr><td align="right" style="padding:2px 18px 0"><img src="https://ambikashelf.in/icons/growth.png" alt="Portfolio Growth" width="380" style="width:380px;max-width:80%;margin-left:auto"></td></tr>
-<tr><td class="mobile-padding" style="padding:3px 24px 22px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
-<td width="33.33%" align="center" style="color:#fff;padding:5px"><div style="font-size:19px;line-height:24px">◈</div><div style="font-size:11px;font-weight:bold">Track</div><div style="color:#a9d6ff;font-size:9px">Your Investments</div></td>
-<td width="33.33%" align="center" style="color:#fff;padding:5px"><div style="font-size:19px;line-height:24px">◎</div><div style="font-size:11px;font-weight:bold">Analyse</div><div style="color:#a9d6ff;font-size:9px">Your Growth</div></td>
-<td width="33.33%" align="center" style="color:#fff;padding:5px"><div style="font-size:19px;line-height:24px">◇</div><div style="font-size:11px;font-weight:bold">Build</div><div style="color:#a9d6ff;font-size:9px">A Secure Future</div></td>
-</tr></table></td></tr></table></td></tr>
+
+<tr><td class="mobile-padding" style="padding:16px 26px 5px">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+<tr>
+<td width="100" valign="middle" style="width:100px">
+<a href="https://ambikashelf.in" target="_blank">
+<img class="header-logo" src="https://ambikashelf.in/icons/ambikashelf.png" alt="AmbikaShelf" width="92" style="width:92px;max-width:92px">
+</a>
+</td>
+<td valign="middle" style="padding-left:9px">
+<div class="hero-title" style="color:#fff;font-size:27px;line-height:29px;letter-spacing:-.8px">Portfolio Manager</div>
+<div class="header-tagline" style="color:#b9ddff;font-size:10px;line-height:15px;margin-top:3px">Smarter insights for a brighter tomorrow.</div>
+</td>
+<td width="92" align="right" valign="middle" style="width:92px;color:#c8e4fa;font-size:8px;line-height:12px;letter-spacing:.6px;text-transform:uppercase">Your Wealth<br><strong style="color:#fff">Our Priority</strong></td>
+</tr>
+</table>
+</td></tr>
+
+<tr><td align="left" style="padding:0 14px 0 14px">
+<img class="header-growth" src="https://ambikashelf.in/icons/growth.png" alt="Portfolio Growth" width="520" style="display:block;width:520px;max-width:100%;height:auto;margin:0">
+</td></tr>
+
+<tr><td class="mobile-padding" style="padding:0 24px 13px">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr>
+<td width="33.33%" align="center" style="color:#fff;padding:2px"><div style="font-size:15px;line-height:18px">◈</div><div style="font-size:10px;font-weight:bold">Track</div><div style="color:#a9d6ff;font-size:8px;margin-top:1px">Your Investments</div></td>
+<td width="33.33%" align="center" style="color:#fff;padding:2px"><div style="font-size:15px;line-height:18px">◎</div><div style="font-size:10px;font-weight:bold">Analyse</div><div style="color:#a9d6ff;font-size:8px;margin-top:1px">Your Growth</div></td>
+<td width="33.33%" align="center" style="color:#fff;padding:2px"><div style="font-size:15px;line-height:18px">◇</div><div style="font-size:10px;font-weight:bold">Build</div><div style="color:#a9d6ff;font-size:8px;margin-top:1px">A Secure Future</div></td>
+</tr></table>
+</td></tr>
+
+</table>
+</td></tr>
 
 <!-- CONTENT -->
 <tr><td style="background:#f4faff">
@@ -136,7 +161,11 @@ body{font-family:Arial,Helvetica,sans-serif}table{border-spacing:0;border-collap
 <tr><td class="mobile-padding" style="padding:6px 34px 22px"><div style="color:#12385e;font-size:13px;line-height:22px">Thank you for trusting <strong>AmbikaShelf</strong> to manage your wealth.</div><div style="color:#385a78;font-size:13px;line-height:21px;margin-top:18px">Best Regards,</div><div style="color:#0865bd;font-family:Georgia,'Times New Roman',serif;font-size:15px;font-weight:bold;margin-top:2px">AmbikaShelf Wealth Management</div><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td align="right" style="padding-top:3px"><img src="https://ambikashelf.in/icons/signature.png" alt="Signature" width="130" style="width:130px;max-width:130px;margin-left:auto"></td></tr></table><div style="width:42px;height:3px;background:#1385d4;margin-top:-7px"></div></td></tr>
 
 <!-- FOOTER -->
-<tr><td style="background:#032750;border-radius:0 0 22px 22px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td class="mobile-padding" style="padding:28px 34px 30px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td valign="middle"><a href="https://ambikashelf.in" target="_blank"><img src="https://ambikashelf.in/icons/ambikashelf.png" alt="AmbikaShelf" width="125" style="width:125px;max-width:125px"></a><div style="color:#8fbce0;font-size:10px;margin-top:7px">Portfolio Manager</div><div style="color:#6d9cc4;font-size:9px;margin-top:4px">Learn · Track · Grow</div></td><td align="right" valign="middle"><a href="https://instagram.com/ambikashelf" target="_blank" style="display:inline-block;width:28px;height:28px;line-height:28px;border:1px solid #4d789e;border-radius:50%;text-align:center;color:#fff;font-size:12px;margin-left:4px">◎</a><a href="https://linkedin.com/ambikashelf" target="_blank" style="display:inline-block;width:28px;height:28px;line-height:28px;border:1px solid #4d789e;border-radius:50%;text-align:center;color:#fff;font-size:11px;margin-left:4px">in</a></td></tr></table>
+<tr><td style="background:#032750;border-radius:0 0 22px 22px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td class="mobile-padding" style="padding:28px 34px 30px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td valign="middle"><a href="https://ambikashelf.in" target="_blank"><img src="https://ambikashelf.in/icons/ambikashelf.png" alt="AmbikaShelf" width="125" style="width:125px;max-width:125px"></a><div style="color:#8fbce0;font-size:10px;margin-top:7px">Portfolio Manager</div><div style="color:#6d9cc4;font-size:9px;margin-top:4px">Learn · Track · Grow</div></td><td align="right" valign="middle"><a href="https://instagram.com/ambikashelf" target="_blank" class="social-icon" style="display:inline-block;width:30px;height:30px;line-height:30px;border:1px solid #4d789e;border-radius:50%;text-align:center;color:#fff;font-size:12px;font-weight:bold;margin-left:4px">◎</a>
+<a href="https://linkedin.com/ambikashelf" target="_blank" class="social-icon" style="display:inline-block;width:30px;height:30px;line-height:30px;border:1px solid #4d789e;border-radius:50%;text-align:center;color:#fff;font-size:11px;font-weight:bold;margin-left:4px">in</a>
+<a href="https://facebook.com/ambikashelf" target="_blank" class="social-icon" style="display:inline-block;width:30px;height:30px;line-height:30px;border:1px solid #4d789e;border-radius:50%;text-align:center;color:#fff;font-size:15px;font-weight:bold;margin-left:4px">f</a>
+<a href="https://wa.me/919125573750" target="_blank" class="social-icon" style="display:inline-block;width:30px;height:30px;line-height:30px;border:1px solid #4d789e;border-radius:50%;text-align:center;color:#fff;font-size:9px;font-weight:bold;margin-left:4px">WA</a>
+<a href="mailto:support@ambikashelf.in" class="social-icon" style="display:inline-block;width:30px;height:30px;line-height:30px;border:1px solid #4d789e;border-radius:50%;text-align:center;color:#fff;font-size:13px;font-weight:bold;margin-left:4px">✉</a></td></tr></table>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:20px"><tr><td style="height:1px;background:#28527a;font-size:1px;line-height:1px">&nbsp;</td></tr></table>
 <div style="margin-top:17px;font-size:10px;line-height:19px"><a href="mailto:${supportEmail}" style="color:#b9dcf7">Support</a><span style="color:#527796">&nbsp;&nbsp;|&nbsp;&nbsp;</span><a href="https://ambikashelf.in/privacy.html" target="_blank" style="color:#b9dcf7">Privacy Policy</a><span style="color:#527796">&nbsp;&nbsp;|&nbsp;&nbsp;</span><a href="https://ambikashelf.in/terms.html" target="_blank" style="color:#b9dcf7">Terms of Service</a></div>
 <div style="color:#7da4c5;font-size:9px;line-height:17px;margin-top:12px">© ${currentYear} AmbikaShelf. All rights reserved.</div><div style="color:#7da4c5;font-size:9px;line-height:17px">This is an automated monthly portfolio report.</div><div style="color:#8fb1cb;font-size:9px;line-height:16px;margin-top:14px">Do not reply to this email, if you have any concerns mail us at <a href="mailto:${supportEmail}" style="color:#fff;text-decoration:underline;font-weight:bold">${supportEmail}</a></div><div style="text-align:right;color:#477596;font-family:Georgia,'Times New Roman',serif;font-size:16px;line-height:20px;font-style:italic;margin-top:15px">Invest.<br>Learn.<br>Grow.</div>
