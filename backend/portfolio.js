@@ -1135,6 +1135,20 @@ async function getMFPrice(code) {
   return hist.series[hist.series.length - 1].price;
 }
 
+// "Day" for a mutual fund = today's NAV vs the previous PUBLISHED NAV —
+// not a rolling 24h window. MF NAVs are date-only and typically published
+// with a lag (often the "latest" NAV is already >24h old by the time it
+// shows up), so a rolling daysAgo(1) anchor frequently lands on the exact
+// same data point as "current," always showing a ₹0 / 0% day change. This
+// mirrors getStockPrevCloseAnchor's approach: current price minus the
+// entry right before it in the series, whatever that entry's date is.
+async function getMFPrevNavAnchor(code) {
+  var hist = await getMFHistory(code);
+  var s = hist.series;
+  if (s.length < 2) return null;
+  return { date: s[s.length - 2].t, price: s[s.length - 2].price };
+}
+
 async function getMFChartData(code, range) {
   var hist = await getMFHistory(code);
   var days = RANGE_DAYS[range] || 365;
@@ -1528,7 +1542,9 @@ router.get('/gains', requireUser, async function(req, res) {
       return { id: String(h._id), gains: computeGainsForHolding(series, current, unitsAsOf, inception), currentPrice: current };
     }));
 
-    // ── Mutual funds (onetime + SIP) ──
+    // ── Mutual funds (onetime + SIP) ── "Day" = today's NAV vs the
+    // previous published NAV (not a rolling 24h window — see
+    // getMFPrevNavAnchor for why that always showed ₹0).
     var mfGains = await Promise.all(mfs.map(async function(h) {
       var hist = await getMFHistory(h.schemeCode);
       var current = hist.series.length ? hist.series[hist.series.length - 1].price : null;
@@ -1548,9 +1564,12 @@ router.get('/gains', requireUser, async function(req, res) {
         inception = { date: new Date(h.purchaseDate), price: h.buyPrice, units: h.units };
       }
 
+      var prevNav = await getMFPrevNavAnchor(h.schemeCode);
+      var dayAnchor = prevNav ? { date: prevNav.date, price: prevNav.price } : null;
+
       return {
         id: String(h._id),
-        gains: computeGainsForHolding(hist.series, current, unitsAsOf, inception),
+        gains: computeGainsForHolding(hist.series, current, unitsAsOf, inception, dayAnchor),
         currentPrice: current,
         totalUnits: totalUnits != null ? parseFloat(totalUnits.toFixed(4)) : null,
         currentValue: (current != null && totalUnits != null) ? parseFloat((current * totalUnits).toFixed(2)) : null,
