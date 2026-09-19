@@ -21,6 +21,7 @@
     "@emailjs/nodejs": "^4.0.0",
     "resend": "^6.1.0",
     "socket.io": "^4.7.2",
+     "puppeteer": "^24.20.0", 
     "node-fetch": "^2.6.7",
     "web-push": "^3.6.7"
   },
