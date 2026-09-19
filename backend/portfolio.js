@@ -10,7 +10,7 @@
 //  Crypto       → CoinCap.io (free, no key) + CoinGecko fallback
 //  Mutual Funds → MFAPI.in (free, no key, full NAV history + search)
 //  Gold/Silver/
-//  Platinum     → MetalPriceAPI (spot) + a retail premium adjustment,
+//  Platinum     → Metals.Dev (spot) + a retail premium adjustment,
 //                 since digital-gold apps (Paytm etc.) sell at spot +
 //                 GST + dealer spread, not raw spot price.
 // ═══════════════════════════════════════════════════════════════
@@ -20,7 +20,8 @@ const mongoose = require('mongoose');
 const router   = express.Router();
 const fetch    = require('node-fetch');
 
-const METAL_API_KEY = process.env.METAL_API_KEY || '54d0079d3085b015926ed9d17c67931e';
+// Same env var name as before (METAL_API_KEY) — just pointed at Metals.Dev now.
+const METAL_API_KEY = process.env.METAL_API_KEY || 'P4CP1LRAUOCQKWP0SWBQ734P0SWBQ';
 
 // ══════════════════════════════════════════════════════════════════
 //  MONGOOSE SCHEMAS
@@ -87,6 +88,22 @@ const stockPriceSnapshotSchema = new mongoose.Schema({
 });
 stockPriceSnapshotSchema.index({ ts: 1 }, { expireAfterSeconds: 30 * 24 * 3600 }); // auto-expire after 30 days
 const StockPriceSnapshot = mongoose.models.StockPriceSnapshot || mongoose.model('StockPriceSnapshot', stockPriceSnapshotSchema);
+
+// Metals persistence — survives process restarts/cold-starts so the
+// live-price fetch and the one-time historical backfill (see the METALS
+// section below) are true one-time costs, not "once per process lifetime."
+const metalLiveSnapshotSchema = new mongoose.Schema({
+  _id:       { type: String, default: 'latest' }, // singleton doc
+  metals:    { gold: Number, silver: Number, platinum: Number }, // raw spot, INR/gram
+  fetchedAt: { type: Date, required: true },
+});
+const MetalLiveSnapshot = mongoose.models.MetalLiveSnapshot || mongoose.model('MetalLiveSnapshot', metalLiveSnapshotSchema);
+
+const metalDailySpotSchema = new mongoose.Schema({
+  date:     { type: String, required: true, unique: true, index: true }, // YYYY-MM-DD, IST
+  gold:     Number, silver: Number, platinum: Number, // raw wholesale spot, INR/gram
+});
+const MetalDailySpot = mongoose.models.MetalDailySpot || mongoose.model('MetalDailySpot', metalDailySpotSchema);
 
 // ══════════════════════════════════════════════════════════════════
 //  CACHE
@@ -789,35 +806,40 @@ async function searchCrypto(q) {
 }
 
 // ══════════════════════════════════════════════════════════════════
-//  METALS — Gold / Silver / Platinum via MetalPriceAPI + retail premium
+//  METALS — Gold / Silver / Platinum via Metals.Dev + retail premium
 //
-//  IMPORTANT QUOTA NOTE: MetalPriceAPI's free plan allows only 100 API
-//  requests per MONTH, total. The previous version re-fetched every
-//  historical anchor date every 6 hours — since a past date's price
-//  never changes, that was burning the entire monthly quota within a
-//  day or two, after which every metal call failed and the UI fell
-//  back to a stale hardcoded price (which is exactly the "gold shows
-//  13,729 instead of 15,600" / "chart looks wrong" symptom reported).
-//  Fix: historical dates are now cached essentially permanently (they
-//  are immutable facts), and the "live" price is cached for 20 minutes
-//  instead of 1 — a realistic cadence for a 100-req/month budget. A
-//  "sticky" last-known-good value is also kept forever in memory and
-//  used as the fallback instead of the static constant, so a quota lull
-//  shows your last *real* price rather than a months-old number.
+//  API CREDIT STRATEGY:
+//  • LIVE PRICE: Metals.Dev's /v1/latest returns gold+silver+platinum
+//    in ONE call (already converted to INR/gram — no oz/currency math
+//    needed). Cached in memory for 5 HOURS and shared by every visitor
+//    in this process; also persisted to Mongo so a restart within that
+//    5h window reuses the DB copy instead of re-fetching.
+//  • HISTORY (for the graph + week/month/year returns): Metals.Dev's
+//    /v1/timeseries returns up to 30 days of daily rates (for ALL
+//    metals at once) per call, in USD/troy-oz, with that day's own
+//    USD→INR rate bundled in the same response. On the very first run
+//    this app has ever made, we walk back ~370 days in ~13 chunked
+//    calls and persist every day's INR/gram price to MongoDB forever
+//    (a past day's price is an immutable fact). Every run after that —
+//    including after a restart/cold-start, and on every other instance
+//    of this app — loads the full year straight from Mongo with ZERO
+//    API calls, then fetches only the 1 new day that rolls into the
+//    window each time a calendar day passes.
 // ══════════════════════════════════════════════════════════════════
-var METAL_SYMBOL = { gold: 'XAU', silver: 'XAG', platinum: 'XPT' };
+var GRAMS_PER_TROY_OZ = 31.1034768;
 
-// Spot prices from MetalPriceAPI reflect wholesale/LBMA-style rates.
+// Spot prices from Metals.Dev reflect wholesale/LBMA-style rates.
 // Retail digital-gold/silver/platinum apps (Paytm, PhonePe, etc.) charge
-// spot + GST (3%) + a dealer spread — these premiums are tuned to land
-// close to real retail-app prices; tune further via env vars if your
-// app's rate drifts from these.
+// spot + GST (3%) + a dealer spread. These premiums are tuned so that,
+// against Metals.Dev's current spot, they land close to real Indian
+// retail-app prices (~₹16,000/g gold, ~₹246/g silver, ~₹6,960/g
+// platinum) — tune further via env vars if your app's rate drifts.
 var METAL_PREMIUM_PCT = {
-  gold:     parseFloat(process.env.GOLD_PREMIUM_PCT)     || 18,
-  silver:   parseFloat(process.env.SILVER_PREMIUM_PCT)   || 20,
-  platinum: parseFloat(process.env.PLATINUM_PREMIUM_PCT) || 25,
+  gold:     parseFloat(process.env.GOLD_PREMIUM_PCT)     || 18.4,
+  silver:   parseFloat(process.env.SILVER_PREMIUM_PCT)   || 20.3,
+  platinum: parseFloat(process.env.PLATINUM_PREMIUM_PCT) || 25.3,
 };
-var METAL_FALLBACK = { gold: 7400, silver: 95, platinum: 3300 };
+var METAL_FALLBACK = { gold: 16000, silver: 246, platinum: 6960 };
 var METAL_NAME = { gold: 'Digital Gold', silver: 'Digital Silver', platinum: 'Digital Platinum' };
 
 // Sticky "last known good" store — never expires on its own, only ever
@@ -830,77 +852,178 @@ function applyPremium(spotPerGram, type) {
   return spotPerGram * (1 + pct / 100);
 }
 
-async function getMetalSpotPerGram(type) {
-  var sym = METAL_SYMBOL[type];
-  if (!sym) return null;
+// ── LIVE PRICE (shared 5h cache across all visitors) ──
+var LIVE_PRICE_TTL = 5 * 60 * 60 * 1000; // 5 hours
+
+async function getMetalLatestSnapshot() {
+  var ck = 'metals:latest';
+  var cached = getCache(ck, LIVE_PRICE_TTL);
+  if (cached !== null) return cached;
+
+  // Second line of defense against restarts/cold-starts: if some earlier
+  // run (this process or another instance) already fetched within the
+  // last 5h, reuse that instead of spending another API credit.
   try {
-    var url = 'https://api.metalpriceapi.com/v1/latest?api_key=' + METAL_API_KEY + '&base=INR&currencies=' + sym;
-    var r = await fetch(url);
+    var doc = await MetalLiveSnapshot.findById('latest').lean();
+    if (doc && doc.fetchedAt && (Date.now() - new Date(doc.fetchedAt).getTime()) < LIVE_PRICE_TTL) {
+      var reused = { status: 'success', metals: doc.metals };
+      setCache(ck, reused);
+      return reused;
+    }
+  } catch (e) { console.error('[metals live db read]', e.message); }
+
+  try {
+    var url = 'https://api.metals.dev/v1/latest?api_key=' + METAL_API_KEY + '&currency=INR&unit=g';
+    var r = await fetch(url, { headers: { Accept: 'application/json' } });
     if (r.ok) {
       var d = await r.json();
-      if (d && d.rates && d.rates[sym]) return (1 / d.rates[sym]) / 31.1035; // troy oz → gram
-      if (d && d.error) console.error('[metal spot]', type, d.error.code, d.error.info);
+      if (d && d.status === 'success' && d.metals) {
+        setCache(ck, d);
+        MetalLiveSnapshot.updateOne(
+          { _id: 'latest' },
+          { metals: d.metals, fetchedAt: new Date() },
+          { upsert: true }
+        ).catch(function(e){ console.error('[metals live db write]', e.message); });
+        return d;
+      }
+      if (d && d.error_message) console.error('[metals.dev latest]', d.error_code, d.error_message);
     }
-  } catch (e) { console.error('[metal spot]', type, e.message); }
+  } catch (e) { console.error('[metals.dev latest]', e.message); }
   return null;
 }
 
 async function getMetalPrice(type) {
-  var ck = 'mp:' + type;
-  var cached = getCache(ck, 1200000); // 20 min — conservative against the 100/mo quota
-  if (cached !== null) return cached;
-
-  var spot = await getMetalSpotPerGram(type);
-  if (spot) {
-    var price = applyPremium(spot, type);
-    setCache(ck, price);
+  var snap = await getMetalLatestSnapshot();
+  if (snap && snap.metals && snap.metals[type] != null) {
+    var price = applyPremium(snap.metals[type], type); // already INR/gram — no oz/currency math needed
     _stickyGood['mp:' + type] = price;
     return price;
   }
-
   // Fetch failed (quota exhausted, network hiccup, etc.) — prefer the
   // last real price we successfully saw over a hardcoded constant.
   return _stickyGood['mp:' + type] != null ? _stickyGood['mp:' + type] : METAL_FALLBACK[type];
 }
 
-// A past date's price is an immutable fact — cache it effectively
-// forever (10 years) rather than re-spending quota on it daily.
-var PERMANENT_TTL = 315360000000;
+// ── HISTORY (permanent in-memory backfill, done once) ──
+// _dailyMetalSpotINR['YYYY-MM-DD'] = { gold, silver, platinum } — raw
+// wholesale spot in INR/gram (premium applied at read time, so changing
+// a *_PREMIUM_PCT env var instantly re-prices all cached history too).
+var _dailyMetalSpotINR = {};
+var _metalHistoryBackfillDone = false;
+var _metalHistoryBackfillPromise = null;
+var METAL_HISTORY_DAYS = 370;   // a little over a year, so 365-day anchors always resolve
+var METAL_HISTORY_CHUNK = 29;   // Metals.Dev timeseries caps a request at 30 days
 
-async function getMetalHistoricalSpot(type, date) {
-  var sym = METAL_SYMBOL[type];
-  var dateStr = istDateString(date);
-  var ck = 'mh:' + type + ':' + dateStr;
-  var cached = getCache(ck, PERMANENT_TTL);
-  if (cached !== null) return cached;
-
-  // Don't hammer the same failed date repeatedly within a short window.
-  var failCk = 'mhfail:' + type + ':' + dateStr;
-  if (getCache(failCk, 3600000) !== null) return null;
-
+async function fetchMetalTimeseriesChunk(startDate, endDate) {
   try {
-    var url = 'https://api.metalpriceapi.com/v1/' + dateStr + '?api_key=' + METAL_API_KEY + '&base=INR&currencies=' + sym;
-    var r = await fetch(url);
+    var url = 'https://api.metals.dev/v1/timeseries?api_key=' + METAL_API_KEY
+      + '&start_date=' + istDateString(startDate) + '&end_date=' + istDateString(endDate);
+    var r = await fetch(url, { headers: { Accept: 'application/json' } });
     if (r.ok) {
       var d = await r.json();
-      if (d && d.rates && d.rates[sym]) {
-        var spot = (1 / d.rates[sym]) / 31.1035;
-        var price = applyPremium(spot, type);
-        setCache(ck, price);
-        return price;
-      }
-      if (d && d.error) console.error('[metal historical]', type, dateStr, d.error.code, d.error.info);
+      if (d && d.status === 'success' && d.rates) return d.rates;
+      if (d && d.error_message) console.error('[metals.dev timeseries]', d.error_code, d.error_message);
     }
-  } catch (e) { console.error('[metal historical]', type, dateStr, e.message); }
-  setCache(failCk, true);
+  } catch (e) { console.error('[metals.dev timeseries]', e.message); }
   return null;
 }
 
-// Real-anchored series across the last year, fetched once and cached
-// permanently per-date (see above) — genuine historical data points,
-// linearly interpolated for the visual line between them. More anchors
-// than before so Week/Month/Year ranges each show a genuinely different
-// shape instead of all collapsing to the same couple of points.
+// Walks back METAL_HISTORY_DAYS: first loads whatever's already persisted
+// in MongoDB (from any prior run of this app, ever — a past day's price
+// never changes, so once a day is in the DB it's done for good), then
+// hits the API only for the genuinely missing offsets — normally NONE
+// after the very first run, or just the 1 new day that rolls into the
+// window each time a calendar day passes. Guarded so concurrent
+// site-opens during a cold start share one backfill, not racing duplicates.
+async function ensureMetalHistoryBackfilled() {
+  if (_metalHistoryBackfillDone) return;
+  if (_metalHistoryBackfillPromise) return _metalHistoryBackfillPromise;
+
+  _metalHistoryBackfillPromise = (async function() {
+    // 1) Load everything already persisted — zero API calls.
+    try {
+      var docs = await MetalDailySpot.find({}).lean();
+      docs.forEach(function(doc) {
+        _dailyMetalSpotINR[doc.date] = { gold: doc.gold, silver: doc.silver, platinum: doc.platinum };
+      });
+    } catch (e) { console.error('[metals history db read]', e.message); }
+
+    // 2) Find the actual gap within the window we care about (offsets 1
+    //    through METAL_HISTORY_DAYS days ago). On a fresh DB this is the
+    //    whole window (~13 chunked calls, once, ever). On every later
+    //    restart it's typically empty, or just the newest 1-2 days.
+    var minMissing = null, maxMissing = null;
+    for (var i = 1; i <= METAL_HISTORY_DAYS; i++) {
+      if (!_dailyMetalSpotINR[istDateString(daysAgo(i))]) {
+        if (minMissing === null) minMissing = i;
+        maxMissing = i;
+      }
+    }
+
+    if (minMissing !== null) {
+      var newlyFetched = {};
+      var endOffset = minMissing;
+      while (endOffset <= maxMissing) {
+        var startOffset = Math.min(endOffset + METAL_HISTORY_CHUNK - 1, maxMissing);
+        var rates = await fetchMetalTimeseriesChunk(daysAgo(startOffset), daysAgo(endOffset));
+        if (rates) {
+          Object.keys(rates).forEach(function(dateStr) {
+            var row = rates[dateStr];
+            if (!row || !row.metals) return;
+            var inrPerUsd = row.currencies && row.currencies.INR; // value of 1 INR in USD
+            if (!inrPerUsd) return;
+            var out = {};
+            ['gold', 'silver', 'platinum'].forEach(function(m) {
+              var usdPerToz = row.metals[m];
+              if (usdPerToz == null) return;
+              var usdPerGram = usdPerToz / GRAMS_PER_TROY_OZ;
+              out[m] = usdPerGram / inrPerUsd; // USD/gram → INR/gram
+            });
+            _dailyMetalSpotINR[dateStr] = out;
+            newlyFetched[dateStr] = out;
+          });
+        }
+        endOffset = startOffset + 1;
+      }
+
+      // 3) Persist whatever we just fetched so no process — this one on
+      //    its next restart, or any other instance — ever pays for these
+      //    dates again.
+      var ops = Object.keys(newlyFetched).map(function(ds) {
+        var v = newlyFetched[ds];
+        return { updateOne: { filter: { date: ds }, update: { $set: { date: ds, gold: v.gold, silver: v.silver, platinum: v.platinum } }, upsert: true } };
+      });
+      if (ops.length) {
+        try { await MetalDailySpot.bulkWrite(ops, { ordered: false }); } catch (e) { console.error('[metals history db write]', e.message); }
+      }
+    }
+
+    _metalHistoryBackfillDone = true;
+  })();
+
+  try { await _metalHistoryBackfillPromise; } finally { _metalHistoryBackfillPromise = null; }
+}
+
+async function getMetalHistoricalSpot(type, date) {
+  await ensureMetalHistoryBackfilled();
+  var dateStr = istDateString(date);
+  var row = _dailyMetalSpotINR[dateStr];
+  if (row && row[type] != null) return applyPremium(row[type], type);
+
+  // Weekend/holiday gap or a date just outside the backfilled window —
+  // fall back to the nearest earlier cached day rather than returning null.
+  var keys = Object.keys(_dailyMetalSpotINR).filter(function(k){ return k <= dateStr; }).sort();
+  if (keys.length) {
+    var nearest = _dailyMetalSpotINR[keys[keys.length - 1]];
+    if (nearest && nearest[type] != null) return applyPremium(nearest[type], type);
+  }
+  return null;
+}
+
+// Real-anchored series across the last year — genuine historical data
+// points (from the permanent backfill above), linearly interpolated for
+// the visual line between them. More anchors than a plain year/month/week
+// split so each chart range shows a genuinely different shape.
 var METAL_ANCHOR_DAYS = [365, 300, 240, 180, 120, 90, 60, 45, 30, 21, 14, 10, 7, 5, 3, 1, 0];
 
 async function getMetalHistory(type) {
@@ -935,6 +1058,42 @@ async function getMetalChartData(type, range) {
   }
   return series;
 }
+
+// ── NIGHTLY POLLER (keeps data fresh with ZERO visitors) ──
+// Every proxy/gains route above only fetches on demand — if nobody hits
+// this app for several days, nothing refreshes on its own. That's fine
+// for the live/history caches themselves, but it's a real problem for
+// anything reading this data without going through a request first (e.g.
+// an external monthly-report job) — it would see however-many-days-old
+// numbers. This mirrors the stock poller's setInterval pattern above:
+// runs independently of any visitor, once per IST calendar day, in a
+// late-night window (so that day's closing price is captured before any
+// job needing fresh data — like a report firing on the 1st — runs).
+var METAL_POLL_CHECK_MS  = 15 * 60 * 1000; // cheap timer tick — costs no API credits by itself
+var METAL_NIGHT_HOUR_IST = 23;             // 11 PM IST
+var _metalPollerStarted  = false;
+var _lastMetalPollDateIST = null;
+
+async function nightlyMetalPollTick() {
+  var nowIST = new Date(Date.now() + IST_OFFSET_MS);
+  if (nowIST.getUTCHours() !== METAL_NIGHT_HOUR_IST) return; // only act during the night window
+  var todayIST = istDateString(new Date());
+  if (_lastMetalPollDateIST === todayIST) return; // already ran tonight
+  try {
+    await getMetalLatestSnapshot();          // refreshes if the 5h cache/DB copy has gone stale
+    _metalHistoryBackfillDone = false;        // force tonight's gap-check even if flagged "done" from days ago
+    await ensureMetalHistoryBackfilled();     // only actually calls the API if a day is genuinely missing
+    _lastMetalPollDateIST = todayIST;
+  } catch (e) { console.error('[metal nightly poll]', e.message); }
+}
+
+function startMetalPoller() {
+  if (_metalPollerStarted) return;
+  _metalPollerStarted = true;
+  setTimeout(nightlyMetalPollTick, 20000); // give the DB connection a moment on cold start
+  setInterval(nightlyMetalPollTick, METAL_POLL_CHECK_MS);
+}
+startMetalPoller();
 
 // ══════════════════════════════════════════════════════════════════
 //  MUTUAL FUNDS — MFAPI.in (free, no key)
@@ -1094,6 +1253,24 @@ router.get('/proxy/metal', async function(req, res) {
   var type = req.query.type || 'gold';
   var price = await getMetalPrice(type);
   res.json({ price: price, type: type });
+});
+
+// For hosts that fully sleep the process when idle (many free tiers do),
+// the in-process nightly poller above can't fire on its own — nothing is
+// running to fire it. Point an external scheduler (cron-job.org, GitHub
+// Actions on a schedule, your host's own cron add-on, etc.) at this route
+// once nightly instead; it does the exact same refresh, safely repeatable
+// (it costs an API credit only if data is genuinely stale/missing).
+router.get('/cron/refresh-metals', async function(req, res) {
+  try {
+    await getMetalLatestSnapshot();
+    _metalHistoryBackfillDone = false;
+    await ensureMetalHistoryBackfilled();
+    res.json({ success: true });
+  } catch (e) {
+    console.error('[cron refresh-metals]', e.message);
+    res.status(500).json({ success: false, msg: e.message });
+  }
 });
 
 router.get('/proxy/metal-chart', async function(req, res) {
