@@ -12,8 +12,7 @@ const User = require('./models/User');
 const Referral = require('./models/Referral');
 const NotificationSubscriber = require('./models/NotificationSubscriber');
 const sendWelcomeMail = require('./welcomeMail');
-// line 15
-const { sendEmail, startMonthlyReportScheduler, registerMonthlyReportRoutes } = require("./emailService");
+const { sendEmail } = require("./emailService");
 const walletRoutes = require('./wallet');
 const http = require("http");
 const { Server } = require("socket.io");
@@ -326,7 +325,7 @@ app.post('/api/pdf/create', async (req, res) => {
   }
 });
 
-registerMonthlyReportRoutes(app);
+
 
 
 app.use('/api/wallet', walletRoutes);             // ← MOVED DOWN ✅
