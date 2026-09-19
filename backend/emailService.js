@@ -407,7 +407,7 @@ async function findUser(email) {
 async function buildAndSendReport(email, info, browser) {
   const user = await findUser(email);
   if (!user) return { status: "skipped", reason: "no user account for this email" };
-  if (user.monthlyReportsEnabled === false) return { status: "skipped", reason: "user opted out" };
+  if (user.monthlyReportsEnabled !== true) return { status: "skipped", reason: "user is not subscribed to monthly reports" };
 
   const password = buildPdfPassword(user.name, getBirthYear(user));
   if (!password) return { status: "skipped", reason: "missing name or birth year - cannot create the PDF password" };
@@ -492,10 +492,19 @@ async function finishLog(email, month, patch) {
 let _running = false;
 
 async function listRecipients() {
-  const { models } = require("./portfolio"); // { StockHolding, CryptoHolding, UtilityHolding, MutualFundHolding }
-  const lists = await Promise.all(Object.values(models).map((M) => M.distinct("userEmail")));
+  // Monthly reports are sent ONLY to users who explicitly subscribed.
+  // Use the raw MongoDB collection so this also works if the existing
+  // User mongoose schema has not yet declared the new monthly-report fields.
+  const User = require("./models/User");
+  const rows = await User.collection
+    .find({ monthlyReportsEnabled: true, email: { $exists: true, $ne: "" } })
+    .project({ email: 1 })
+    .toArray();
+
   const set = new Set();
-  lists.forEach((arr) => arr.forEach((e) => { if (e) set.add(String(e).toLowerCase().trim()); }));
+  rows.forEach((u) => {
+    if (u && u.email) set.add(String(u.email).toLowerCase().trim());
+  });
   return Array.from(set);
 }
 
@@ -615,6 +624,108 @@ function startMonthlyReportScheduler() {
  *  The key can also be sent as an  x-cron-key  header. Disabled unless CRON_SECRET is set.
  */
 function registerMonthlyReportRoutes(app) {
+
+  // Get the logged-in user's monthly-report subscription status.
+  app.get("/api/monthly-report/settings", async (req, res) => {
+    try {
+      const email = String(req.get("x-user-email") || req.query.email || "").trim().toLowerCase();
+      if (!email) return res.status(400).json({ success: false, msg: "Email is required" });
+
+      const User = require("./models/User");
+      const user = await User.collection.findOne(
+        { email: { $regex: "^" + escapeRegExp(email) + "$", $options: "i" } },
+        { projection: { name: 1, email: 1, monthlyReportsEnabled: 1, monthlyReport: 1, dob: 1 } }
+      );
+
+      if (!user) return res.status(404).json({ success: false, msg: "User not found" });
+
+      res.json({
+        success: true,
+        name: user.name || "",
+        email: user.email || email,
+        subscribed: user.monthlyReportsEnabled === true,
+        dob: user.dob || (user.monthlyReport && user.monthlyReport.dob) || ""
+      });
+    } catch (err) {
+      log("settings GET error:", err.message);
+      res.status(500).json({ success: false, msg: "Server error" });
+    }
+  });
+
+  // Subscribe / update the monthly-report settings.
+  // DOB is mandatory because it is also used to derive the PDF password.
+  app.post("/api/monthly-report/settings", async (req, res) => {
+    try {
+      const email = String(req.get("x-user-email") || req.body.email || "").trim().toLowerCase();
+      const dob = String(req.body.dob || "").trim();
+      const enabled = req.body.enabled !== false;
+
+      if (!email) return res.status(400).json({ success: false, msg: "Email is required" });
+
+      const User = require("./models/User");
+      const user = await User.collection.findOne(
+        { email: { $regex: "^" + escapeRegExp(email) + "$", $options: "i" } },
+        { projection: { name: 1, email: 1 } }
+      );
+      if (!user) return res.status(404).json({ success: false, msg: "User not found" });
+
+      if (enabled) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(dob)) {
+          return res.status(400).json({ success: false, msg: "DOB is required" });
+        }
+
+        const parsedDob = new Date(dob + "T00:00:00.000Z");
+        if (Number.isNaN(parsedDob.getTime())) {
+          return res.status(400).json({ success: false, msg: "Invalid DOB" });
+        }
+
+        await User.collection.updateOne(
+          { _id: user._id },
+          {
+            $set: {
+              monthlyReportsEnabled: true,
+              dob: parsedDob,
+              monthlyReport: {
+                email: true,
+                whatsapp: false,
+                dob: parsedDob,
+                subscribedAt: new Date()
+              }
+            }
+          }
+        );
+
+        return res.json({
+          success: true,
+          subscribed: true,
+          name: user.name || "",
+          email: user.email || email
+        });
+      }
+
+      await User.collection.updateOne(
+        { _id: user._id },
+        {
+          $set: {
+            monthlyReportsEnabled: false,
+            "monthlyReport.email": false,
+            "monthlyReport.subscribedAt": new Date()
+          }
+        }
+      );
+
+      return res.json({
+        success: true,
+        subscribed: false,
+        name: user.name || "",
+        email: user.email || email
+      });
+    } catch (err) {
+      log("settings POST error:", err.message);
+      res.status(500).json({ success: false, msg: "Server error" });
+    }
+  });
+
   app.all("/api/cron/monthly-reports", async (req, res) => {
     const secret = process.env.CRON_SECRET || "";
     const provided = String(req.get("x-cron-key") || (req.query && req.query.key) || "");
