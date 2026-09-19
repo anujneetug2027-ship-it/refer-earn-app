@@ -12,6 +12,7 @@ const User = require('./models/User');
 const Referral = require('./models/Referral');
 const NotificationSubscriber = require('./models/NotificationSubscriber');
 const sendWelcomeMail = require('./welcomeMail');
+const { sendEmail } = require("./emailService");
 const walletRoutes = require('./wallet');
 const http = require("http");
 const { Server } = require("socket.io");
