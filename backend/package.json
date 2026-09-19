@@ -19,7 +19,8 @@
     "razorpay": "^2.9.2",
     "cookie-parser": "^1.4.6",
     "@emailjs/nodejs": "^4.0.0",
-    "resend": "^6.1.0", 
+    "resend": "^6.1.0",
+    "puppeteer": "^24.20.0", 
     "socket.io": "^4.7.2",
     "node-fetch": "^2.6.7",
     "web-push": "^3.6.7"
