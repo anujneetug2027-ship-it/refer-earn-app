@@ -67,7 +67,7 @@ function sendReport(data){
  frame.src='monthlyreport.html?embedded=1';
  document.getElementById('previewLabel').textContent='Preview • '+(data.month||monthNow());
 }
-async function load(){try{const override=parsedOverride();const d=override||await liveData();if(!d.trend)d.trend=[];d._generator={generatedAt:new Date().toISOString()};window.reportData=d;sendReport(d);status('Report loaded. Preview is using the same portfolio endpoints as portfolio.html.','ok')}catch(e){console.error(e);status('<span class="danger">'+e.message+'</span>','danger')}}
+async function load(){try{const override=parsedOverride();const d=override||await liveData();if(!override){delete d.trend;delete d.categoryTrends;}d._generator={generatedAt:new Date().toISOString(),chartRange:'1M',chartMonth:d.month};window.reportData=d;sendReport(d);status('Report loaded. Charts are rebuilt for the selected report month.','ok')}catch(e){console.error(e);status('<span class="danger">'+e.message+'</span>','danger')}}
 async function waitForFrame(){return new Promise((resolve,reject)=>{const started=Date.now();const ready=()=>{const doc=frame.contentDocument;const pages=doc&&doc.querySelectorAll('.report-page').length;const chartsReady=frame.contentWindow&&frame.contentWindow.__AMBICASHELF_CHARTS_READY===true;if(pages&&chartsReady){clearInterval(timer);resolve()}else if(Date.now()-started>90000){clearInterval(timer);reject(new Error(chartsReady?'Report preview did not finish rendering.':'Report chart data did not finish loading.'))}};const timer=setInterval(ready,200);ready()})}
 async function waitForReportAssets(){
  const doc=frame.contentDocument;
