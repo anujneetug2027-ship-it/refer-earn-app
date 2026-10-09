@@ -1,0 +1,18 @@
+{
+  "name": "ambikashelf-portfolio-search-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Read-only MCP adapter for AmbikaShelf portfolio asset search endpoints",
+  "type": "commonjs",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "express": "^4.21.2",
+    "zod": "^3.24.2"
+  }
+}

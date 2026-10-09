@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: ambikashelf-portfolio-search-mcp
+    runtime: node
+    rootDir: ambikashelf-mcp-adapter
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: AMBIKASHELF_API_BASE_URL
+        value: https://refer-earn-app.onrender.com
