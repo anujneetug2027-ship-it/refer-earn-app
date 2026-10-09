@@ -70,10 +70,63 @@ async function searchEndpoint(path, query) {
   }
 }
 
+
+async function getWorldChatUsers(query = '') {
+  const url = new URL(`${API_BASE_URL}/api/notify/users`);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10_000);
+  try {
+    const response = await fetch(url, {
+      method: 'GET', headers: { accept: 'application/json' }, signal: controller.signal
+    });
+    if (!response.ok) throw new Error(`WorldChat user lookup returned HTTP ${response.status}`);
+    const payload = await response.json();
+    if (!payload || !Array.isArray(payload.users)) throw new Error('WorldChat returned an unexpected user-list response');
+    const users = [...new Set(payload.users.filter(name => typeof name === 'string' && name.trim()).map(name => name.trim()))];
+    const q = query.trim().toLowerCase();
+    return q ? users.filter(name => name.toLowerCase().includes(q)).slice(0, 20) : users.slice(0, 100);
+  } finally { clearTimeout(timeout); }
+}
+
+async function postWorldChatMessage(recipientName, message) {
+  const { io } = require('socket.io-client');
+  const users = await getWorldChatUsers('');
+  const wanted = recipientName.trim().toLowerCase();
+  const exactMatches = users.filter(name => name.toLowerCase() === wanted);
+  if (exactMatches.length === 1) {
+    recipientName = exactMatches[0];
+  } else {
+    const candidates = users.filter(name => name.toLowerCase().includes(wanted)).slice(0, 10);
+    if (candidates.length === 1) recipientName = candidates[0];
+    else {
+      const error = new Error(candidates.length
+        ? `Recipient is ambiguous. Choose one exact username: ${candidates.join(', ')}`
+        : 'Recipient was not found in the WorldChat registered-notification name list.');
+      error.candidates = candidates;
+      throw error;
+    }
+  }
+
+  const socket = io(API_BASE_URL, { timeout: 10_000, reconnection: false, transports: ['websocket', 'polling'] });
+  try {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Timed out connecting to WorldChat')), 10_000);
+      socket.once('connect', () => { clearTimeout(timer); resolve(); });
+      socket.once('connect_error', error => { clearTimeout(timer); reject(new Error(`WorldChat connection failed: ${error.message}`)); });
+    });
+    socket.emit('join', 'AmbikaShelf GPT');
+    const publicText = `@${recipientName} ${message.trim()}`;
+    socket.emit('sendMessage', { text: publicText, isBot: true });
+    // Existing server has no send acknowledgement. This only confirms socket submission.
+    await new Promise(resolve => setTimeout(resolve, 250));
+    return { submitted: true, recipient: recipientName, publicText, sender: 'AmbikaShelf' };
+  } finally { socket.disconnect(); }
+}
+
 function createMcpServer() {
   const server = new McpServer({
-    name: 'ambikashelf-portfolio-search',
-    version: '0.1.0'
+    name: 'ambikashelf-portfolio-and-worldchat',
+    version: '0.2.0'
   });
 
   const querySchema = { query: z.string().trim().min(2).max(80).describe('Asset name, symbol, or search phrase (2–80 characters).') };
@@ -116,6 +169,48 @@ function createMcpServer() {
         return { content: [{ type: 'text', text: JSON.stringify({ results }) }] };
       } catch (error) {
         return { isError: true, content: [{ type: 'text', text: `Crypto search failed: ${error.message}` }] };
+      }
+    }
+  );
+
+
+  const worldChatQuerySchema = {
+    query: z.string().trim().min(2).max(60).describe('WorldChat username or part of a username.')
+  };
+
+  server.tool(
+    'search_worldchat_users',
+    'Find candidate usernames from AmbikaShelf WorldChat registered notification names. Lookup only; does not send a message. The list may not include every account, only names registered for push notifications.',
+    worldChatQuerySchema,
+    async ({ query }) => {
+      try {
+        const users = await getWorldChatUsers(query);
+        return { content: [{ type: 'text', text: JSON.stringify({ query, matches: users, count: users.length }) }] };
+      } catch (error) {
+        return { isError: true, content: [{ type: 'text', text: `WorldChat user lookup failed: ${error.message}` }] };
+      }
+    }
+  );
+
+  const sendWorldChatSchema = {
+    recipient_name: z.string().trim().min(2).max(40).describe('Recipient username confirmed from search_worldchat_users.'),
+    message: z.string().trim().min(1).max(1000).describe('Clear, natural message already refined by the assistant. It will be posted publicly and prefixed with @recipient.')
+  };
+
+  server.tool(
+    'send_worldchat_message',
+    'Post a refined message to the existing public AmbikaShelf WorldChat room and @mention the recipient. This is a public write action. Before calling, tell the user the message will be public and resolve the intended username with search_worldchat_users. Posts as the AmbikaShelf bot, not as the human user. The existing chat server has no delivery/read acknowledgement.',
+    sendWorldChatSchema,
+    async ({ recipient_name, message }) => {
+      try {
+        const result = await postWorldChatMessage(recipient_name, message);
+        return { content: [{ type: 'text', text: JSON.stringify({
+          status: 'submitted_to_public_room', sender: result.sender, recipient: result.recipient,
+          publicText: result.publicText,
+          deliveryNote: 'Submitted to the connected WorldChat server; recipient delivery/read is not confirmed.'
+        }) }] };
+      } catch (error) {
+        return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: error.message, candidates: error.candidates || [] }) }] };
       }
     }
   );
